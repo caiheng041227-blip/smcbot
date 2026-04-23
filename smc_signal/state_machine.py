@@ -1402,6 +1402,23 @@ class SignalEngine:
                         self._diag["step5_fail_no_choch"] += 1
 
             if s.step == SignalStep.STEP5_PASSED:
+                # Step6 前置过滤(2026-04-23 加):入场价距 POI 中线不能超过 1.0%
+                # 原因:ICT 流程是 Step3 wick 触达 POI → Step5 CHoCH 确认 → Step6 入场。
+                # 若 CHoCH 磨得久,15m close(入场价)会远离 POI → 追高抄底 → 大概率挂。
+                # 04-18/04-19 两条亏损 long 的入场价距 POI 中线超 1%,都应被这关拦下。
+                if s.poi_low is not None and s.poi_high is not None:
+                    poi_mid = (s.poi_low + s.poi_high) / 2
+                    if poi_mid > 0:
+                        dist_pct = abs(price - poi_mid) / poi_mid
+                        if dist_pct > 0.010:
+                            self._diag["step6_fail_entry_far_from_poi"] += 1
+                            self._invalidate(
+                                sid, s,
+                                f"入场价 {price:.2f} 距 POI 中线 {poi_mid:.2f} "
+                                f"超过 1.0%(实际 {dist_pct*100:.2f}%)"
+                            )
+                            continue
+
                 # Step6:自动计算 SL(选项 B:15m swing 外侧)+ TP(反向 liquidity / POI)
                 atr_4h = self._atr(symbol, "4h")
                 atr_1h = self._atr(symbol, "1h")
