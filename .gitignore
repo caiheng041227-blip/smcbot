@@ -1,0 +1,43 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# 环境变量/密钥
+.env
+.env.local
+
+# 日志
+logs/
+*.log
+
+# 数据库 (运行时产物)
+data/market.db
+data/market.db-*
+
+# 回测产物 / 分析数据(大文件)
+data/analysis/*.csv
+
+# GBrain 派生物
+gbrain_integration/jsonl/
+gbrain_integration/out_markdown/
+gbrain_integration/out_markdown_clean/
+gbrain_integration/out_markdown_*/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code 会话状态
+.claude/
+.mcp.json
+
+# 临时脚本
+tmp_sync/

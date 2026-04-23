@@ -1,0 +1,50 @@
+# SMC/ICT 数据采集层配置
+exchange: okx                   # binance / okx。okx 不受 geo 限制,Lightsail/美东部署用它
+symbol: ETHUSDT                 # Binance USDT 永续
+timeframes:                     # 需要订阅的 K 线周期
+  - 1m                          # 仅用于聚合实时数据；不驱动状态机
+  - 15m                         # Step5 CHoCH 确认、Step6 入场
+  - 1h                          # Step2+3(扫荡事件)、Step4 POI
+  - 4h                          # Step1 方向共识 + 结构反转检查
+  - 1d                          # Step1 方向共识参考
+
+timezone: America/New_York      # 交易日分界时区
+daily_reset_hour: 17            # 17:00 ET = CME 收盘，作为"昨日/今日"分界
+
+volume_profile:
+  buckets: 200                  # VP 价格分档数（可调）
+  value_area_pct: 0.70          # VA 覆盖比例（SMC/ICT 标准 70%）
+
+# 相关性参考品种:Step1 方向共识要求 BTC 不与 ETH 冲突。
+# BTC 崩盘时 ETH 的 SMC 结构通常会失效,这个过滤能避开大部分"反转失败"场景。
+reference:
+  symbol: BTCUSDT
+  timeframe: 4h        # 只订阅这一根 kline 够用,不要额外订阅浪费连接
+
+binance:
+  ws_base: wss://fstream.binance.com
+  # 若需要代理填 socks5://host:port，否则留空字符串
+  proxy: ""
+  # 指数退避参数
+  reconnect_min: 1
+  reconnect_max: 60
+
+storage:
+  db_path: data/market.db
+
+logging:
+  level: INFO
+
+signal:
+  swing_lookback: 5
+  ob_lookback: 120              # 在最近 120 根 4h (≈20 天) 内搜索 OB 候选
+  choch_confirm: close        # 只用收盘价确认 BOS/CHoCH，避免影线假突破
+  score_threshold: 3.0           # 2026-04-20 scorer 重构后(满分 5),阈值 3 = POI 良好 tier + ≥1 个证据
+  signal_ttl_seconds: 129600  # 36h:Step1 TTL(Step2+ 不受时间限制)
+  risk_reward_min: 2.0        # 已弃用(TP 由用户手动决定)
+  level_proximity_pct: 0.005  # 0.5%:Step2 已降级为参考,主要判定改为"K 线影线触碰"
+  # 场景失效阈值(除时间 TTL 外的前提性判定)
+  # price_drift_pct: 已删除 —— 漂移不是有效的失效信号,误杀太多
+  poi_break_pct: 0.01         # C: 收盘价穿透 POI 边界阈值(与 0.5×ATR_4h 取大)
+  sweep_wick_body_ratio: 1.5  # 扫荡事件长影线阈值(原 2.0 放宽)
+

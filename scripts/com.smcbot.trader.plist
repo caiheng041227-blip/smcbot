@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+安装步骤:
+  1. 把本文件拷到 ~/Library/LaunchAgents/com.smcbot.trader.plist
+  2. launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.smcbot.trader.plist
+  3. launchctl enable gui/$UID/com.smcbot.trader
+  4. launchctl kickstart gui/$UID/com.smcbot.trader
+卸载:
+  launchctl bootout gui/$UID/com.smcbot.trader
+
+说明:
+  - KeepAlive=true + SuccessfulExit=false:进程崩溃/异常退出会自动重启
+  - ThrottleInterval=30:最快 30s 重启一次,避免启动失败时的疯狂重启
+  - 日志写到 logs/launchd.*.log,方便事后排查
+  - 用户登录后才运行(LaunchAgent),合盖睡眠时会一并挂起,醒来自动继续
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.smcbot.trader</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/nnnn/Desktop/交易计划agent/venv/bin/python</string>
+        <string>/Users/nnnn/Desktop/交易计划agent/main.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/nnnn/Desktop/交易计划agent</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/nnnn/Desktop/交易计划agent/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/nnnn/Desktop/交易计划agent/logs/launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+    </dict>
+</dict>
+</plist>
