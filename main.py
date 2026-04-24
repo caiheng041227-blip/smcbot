@@ -23,7 +23,8 @@ from dotenv import load_dotenv
 from data.binance_ws import BinanceWS
 from data.okx_ws import OkxWS
 from data.candle_manager import CandleManager, Candle
-from data.rest_backfill import backfill_to_manager
+from data.rest_backfill import backfill_to_manager, fetch_klines
+from datetime import timedelta
 from engine.delta import DeltaTracker
 from engine.key_levels import KeyLevels
 from engine.market_structure import classify_structure
@@ -31,8 +32,93 @@ from engine.volume_profile import VolumeProfileSession, WeeklyVolumeProfileSessi
 from gbrain_integration.logger import log_signal as gbrain_log_signal
 from notify import TelegramNotifier
 from smc_signal import SignalEngine, score as signal_score
+from smc_signal.state_machine import SignalStep
 from storage.database import Database
 from utils.logger import logger, setup_logger
+
+
+async def replay_recent_state(
+    symbol: str,
+    timeframes: list,
+    hours: int,
+    candles: CandleManager,
+    engine: SignalEngine,
+    weekly_vp: WeeklyVolumeProfileSession,
+    levels: KeyLevels,
+    proxy: Optional[str] = None,
+) -> None:
+    """重启后回放近 N 小时历史,重建 state_machine 的 active_signals + VP/levels。
+
+    逻辑:
+      - 拉每个 TF 足够历史(warmup + 回放窗口)
+      - 按 close_time 合并排序,按时间轴重放
+      - close_time < cutoff:仅喂 CandleManager(为后续 engine.window 预热)
+      - close_time >= cutoff:额外驱动 engine + 更新 VP/levels + delta 近似
+      - 回放结束后,所有在回放中推进到 SCORED 的信号标为 notification_sent=True
+        → 防止 live notify_loop 启动后把过期信号误推送出去
+    """
+    cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp() * 1000)
+    tfs = [t for t in timeframes if t != "1m"]  # 1m 不驱动 state_machine
+    bar_counts = {
+        "1d": 30,
+        "4h": 80,
+        "1h": max(200, hours + 100),
+        "15m": max(300, hours * 4 + 200),
+    }
+
+    klines_by_tf: dict = {}
+    for tf in tfs:
+        try:
+            rows = await fetch_klines(symbol, tf, limit=bar_counts.get(tf, 200), proxy=proxy)
+            klines_by_tf[tf] = rows
+            logger.info(f"replay 预取 {symbol} {tf}: {len(rows)} 根")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"replay 预取 {symbol} {tf} 失败: {e}")
+            klines_by_tf[tf] = []
+
+    events = []
+    for tf, rows in klines_by_tf.items():
+        for r in rows:
+            events.append((int(r["T"]), tf, r))
+    events.sort(key=lambda x: x[0])
+
+    replayed = 0
+    for close_time, tf, payload in events:
+        candles.on_kline(symbol, tf, payload)
+        if close_time < cutoff_ms:
+            continue
+        c = candles.last(symbol, tf)
+        if c is None:
+            continue
+        if tf == "15m":
+            ts = datetime.fromtimestamp(c.close_time / 1000, tz=timezone.utc)
+            locked = weekly_vp.on_trade(c.close, c.volume, ts)
+            if locked is not None:
+                levels.update_prev_week(locked)
+            levels.update_weekly(c.close, ts)
+            levels.update_monthly(c.close, ts)
+        d_approx = c.volume * (0.6 if c.close > c.open else -0.6 if c.close < c.open else 0.0)
+        engine.set_bar_delta(tf, d_approx)
+        try:
+            await engine.on_candle_close(symbol, tf, c)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"replay on_candle_close 异常 {tf}@{close_time}: {e}")
+        replayed += 1
+
+    suppressed = 0
+    alive_by_step: dict = {}
+    for sid, s in list(engine.active_signals.items()):
+        if s.step == SignalStep.SCORED:
+            s.notification_sent = True
+            s.step = SignalStep.NOTIFIED
+            suppressed += 1
+        else:
+            alive_by_step[s.step.value] = alive_by_step.get(s.step.value, 0) + 1
+
+    logger.info(
+        f"replay 完成: 处理 {replayed} close 事件 (cutoff={hours}h), "
+        f"抑制 {suppressed} 条过期 SCORED, 保留 in-flight: {alive_by_step}"
+    )
 
 
 ROOT = Path(__file__).parent
@@ -154,17 +240,33 @@ async def main_async() -> None:
         if is_main:
             asyncio.create_task(engine.on_candle_close(sym, tf, c))
 
-    # REST 回填:在订阅 close 回调之前灌入历史数据,state_machine 启动即有完整窗口
-    # 各 TF 需要的根数匹配 state_machine 里的 window() 取值
-    backfill_counts = {"1d": 30, "4h": 50, "1h": 200, "15m": 200}
+    # REST 回填 + 状态回放:在订阅 close 回调之前灌入历史数据,并用近 N 小时
+    # 的 K 线重放驱动 state_machine,恢复 active_signals(Step1/2/3/5 in-flight)。
+    # 这样每次重启/部署不再丢失进行中的信号 —— replay 产生的 SCORED 会被抑制,
+    # 避免重启后把过期信号推送出去。
     bf_proxy = cfg["binance"].get("proxy") or os.getenv("HTTP_PROXY") or None
+    replay_hours = int(cfg.get("replay_hours", 24))
     try:
         kline_tfs = [tf for tf in timeframes if tf != "1m"]
-        await backfill_to_manager(candles, symbol, kline_tfs, backfill_counts, proxy=bf_proxy)
+        if replay_hours > 0:
+            await replay_recent_state(
+                symbol=symbol,
+                timeframes=kline_tfs,
+                hours=replay_hours,
+                candles=candles,
+                engine=engine,
+                weekly_vp=weekly_vp,
+                levels=levels,
+                proxy=bf_proxy,
+            )
+        else:
+            # 回放关闭时退回原纯回填行为
+            backfill_counts = {"1d": 30, "4h": 50, "1h": 200, "15m": 200}
+            await backfill_to_manager(candles, symbol, kline_tfs, backfill_counts, proxy=bf_proxy)
         if ref_symbol:
             await backfill_to_manager(candles, ref_symbol, [ref_tf], {ref_tf: 50}, proxy=bf_proxy)
     except Exception as e:  # noqa: BLE001
-        logger.error(f"REST 回填失败(继续用 WS 冷启动): {e}")
+        logger.error(f"REST 回填/状态回放失败(继续用 WS 冷启动): {e}")
 
     candles.subscribe_close(on_candle_close)
 

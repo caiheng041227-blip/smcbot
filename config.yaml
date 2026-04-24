@@ -32,6 +32,11 @@ binance:
 storage:
   db_path: data/market.db
 
+# 重启后回放:用近 N 小时 K 线驱动 state_machine,恢复 active_signals。
+# 0 = 禁用(仅做数据回填,state 从空开始,每次部署丢失进行中信号)
+# 24 = 回放近 24h(推荐:覆盖 Step1 36h TTL 的大部分场景)
+replay_hours: 24
+
 logging:
   level: INFO
 

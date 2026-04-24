@@ -43,6 +43,8 @@ _POI_TIER_WEIGHTS: Dict[str, float] = {
     # 其它证据作为 bonus(数据显示 equal_lows 单点 89% WR,无需其它确认)
     "1h_equal_lows": 3.0,     # 20 天 89% WR / +19R
     "1h_breaker": 3.0,        # 187 天 41.8% WR / +27R(最佳)
+    "failed_sweep_reentry": 3.0,   # 2026-04-23 升 1.0→3.0:187d 全量 49 笔 49% WR +51.49R,
+                                   # 未通知赢家 +43.71R 占漏网总 R 的 88%,事实最强源
     # Tier B(+1)—— 平均或次优,需要至少 2 个其它证据才过阈值
     "4h_fvg": 1.0,            # 187 天 -10R 但删了暴露更烂,保留中位
     "4h_ob": 1.0,             # 小样本 80% WR(不可信但方向正)
@@ -56,7 +58,6 @@ _POI_TIER_WEIGHTS: Dict[str, float] = {
                               # 1.0 下需其它 2 项证据才过阈值,不轻易推送
     # 2026-04-21 新增 POI 源(Tier B,保守):需至少 2 个其它证据才过阈值。
     # 在历史数据验证前不给 A 级,避免过度乐观;跑一轮 187d 后再升降级。
-    "failed_sweep_reentry": 1.0,   # 中期方案:二次更深 sweep + 收盘拒绝
     "failed_fvg_reentry": 1.0,     # 4h FVG 破位后 reclaim,针对"FVG 被磨损后深扫反弹"
     "double_bottom": 1.0,          # 长期方案:等高双底 + 颈线突破
     "double_top": 1.0,             # 长期方案:等高双顶 + 颈线跌破

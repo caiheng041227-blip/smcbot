@@ -120,6 +120,99 @@ def simulate_outcome(
     return {"outcome": "pending", "pnl_r": 0.0, "bars": bars_after}
 
 
+def simulate_outcome_hybrid(
+    sig_time_ms: int,
+    direction: str,
+    entry: float,
+    sl: float,
+    tp: float,
+    atr_4h: float,
+    future_bars: List[dict],
+    max_hours: int = 168,
+    tp1_portion: float = 0.5,
+    trail_atr_mult: float = 1.5,
+) -> Dict[str, object]:
+    """混合出场:SL 全仓 / TP1 平 `tp1_portion`(结构 TP)/ 剩余用 peak - `trail_atr_mult` × ATR_4h 追踪止盈。
+
+    仓位单位化:初始 1.0,按比例减仓后更新 remaining。
+    返回 {outcome, pnl_r, bars, tp1_hit, trail_price(若触发)}。
+    - outcome:'sl' / 'tp1_only'(TP1 但 trail 未闭)/ 'tp1_trail' / 'pending'
+    - pnl_r:合计 R(以 entry 到 SL 的全仓风险为 1 单位)
+    """
+    if entry is None or sl is None or tp is None or entry == sl:
+        return {"outcome": "pending", "pnl_r": 0.0, "bars": 0, "tp1_hit": False}
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return {"outcome": "pending", "pnl_r": 0.0, "bars": 0, "tp1_hit": False}
+    # 安全兜底:ATR 缺失时 trail 距离用 0.5R(就近跟)
+    trail_dist = trail_atr_mult * atr_4h if atr_4h and atr_4h > 0 else 0.5 * risk
+
+    peak = entry
+    tp1_hit = False
+    realized_r = 0.0
+    remaining = 1.0
+    bars_after = 0
+
+    for k in future_bars:
+        if int(k["t"]) <= sig_time_ms:
+            continue
+        bars_after += 1
+        if bars_after > max_hours:
+            break
+        hi, lo = float(k["h"]), float(k["l"])
+
+        # 同一根 K 内:先判 SL,再判 TP1,最后判 trail —— 保守低估胜率
+        if direction == "long":
+            if lo <= sl:
+                realized_r += remaining * (sl - entry) / risk  # = -remaining
+                return {"outcome": "sl", "pnl_r": round(realized_r, 3),
+                        "bars": bars_after, "tp1_hit": tp1_hit}
+            if not tp1_hit and hi >= tp:
+                realized_r += tp1_portion * (tp - entry) / risk
+                remaining -= tp1_portion
+                tp1_hit = True
+                peak = max(peak, hi)
+            if hi > peak:
+                peak = hi
+            if tp1_hit:
+                trail_stop = peak - trail_dist
+                if lo <= trail_stop and trail_stop > entry:
+                    realized_r += remaining * (trail_stop - entry) / risk
+                    return {"outcome": "tp1_trail", "pnl_r": round(realized_r, 3),
+                            "bars": bars_after, "tp1_hit": True, "trail_price": trail_stop}
+                # trail_stop 仍在 entry 下方时,兜底让 SL 继续起作用
+        else:
+            if hi >= sl:
+                realized_r += remaining * (entry - sl) / risk * -1  # = -remaining
+                return {"outcome": "sl", "pnl_r": round(realized_r, 3),
+                        "bars": bars_after, "tp1_hit": tp1_hit}
+            if not tp1_hit and lo <= tp:
+                realized_r += tp1_portion * (entry - tp) / risk
+                remaining -= tp1_portion
+                tp1_hit = True
+                peak = min(peak, lo)
+            if lo < peak:
+                peak = lo
+            if tp1_hit:
+                trail_stop = peak + trail_dist
+                if hi >= trail_stop and trail_stop < entry:
+                    realized_r += remaining * (entry - trail_stop) / risk
+                    return {"outcome": "tp1_trail", "pnl_r": round(realized_r, 3),
+                            "bars": bars_after, "tp1_hit": True, "trail_price": trail_stop}
+
+    # 时间窗到期或数据用尽
+    if tp1_hit:
+        # TP1 已落袋,余仓未闭 → 按最后一根 close 近似清算余仓(保守估)
+        last_close = float(future_bars[-1]["c"]) if future_bars else entry
+        if direction == "long":
+            realized_r += remaining * (last_close - entry) / risk
+        else:
+            realized_r += remaining * (entry - last_close) / risk
+        return {"outcome": "tp1_only", "pnl_r": round(realized_r, 3),
+                "bars": bars_after, "tp1_hit": True}
+    return {"outcome": "pending", "pnl_r": 0.0, "bars": bars_after, "tp1_hit": False}
+
+
 # --- 主回测流程 ------------------------------------------------------------
 
 def _enrich_signal(
@@ -185,7 +278,7 @@ def _enrich_signal(
     return feat
 
 
-async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: dict, inspect_date: Optional[str] = None, csv_path: Optional[str] = None) -> None:
+async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: dict, inspect_date: Optional[str] = None, csv_path: Optional[str] = None, trail_atr_mult: float = 0.0, tp1_portion: float = 0.5) -> None:
     setup_logger("INFO")
     import os
     proxy = cfg.get("binance", {}).get("proxy") or os.getenv("HTTP_PROXY") or None
@@ -443,7 +536,19 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
             sig["time"], sig["direction"], sig["entry"], sl_sim, tp_sim, future_1h,
             max_hours=168,
         )
-        results.append({**sig, **out})
+        merged = {**sig, **out}
+        # 并行跑 hybrid(仅当启用),与 baseline 对比,不替换
+        if trail_atr_mult > 0:
+            atr_4h_at_sig = (sig.get("_features") or {}).get("atr_4h") or 0.0
+            hy = simulate_outcome_hybrid(
+                sig["time"], sig["direction"], sig["entry"], sl_sim, tp_sim,
+                float(atr_4h_at_sig), future_1h, max_hours=168,
+                tp1_portion=tp1_portion, trail_atr_mult=trail_atr_mult,
+            )
+            merged["hybrid_outcome"] = hy.get("outcome")
+            merged["hybrid_pnl_r"] = hy.get("pnl_r")
+            merged["hybrid_tp1_hit"] = hy.get("tp1_hit")
+        results.append(merged)
 
     # 打印表格
     print(f"\n{'='*100}")
@@ -503,6 +608,33 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
     print("-" * 100)
     print(f"信号: {len(results)}  已闭合: {len(closed)}  胜: {len(wins)}  "
           f"胜率: {(len(wins)/max(1,len(closed))):.1%}  累计 R: {total_r:+.2f}")
+
+    # Hybrid trail 对比汇总
+    if trail_atr_mult > 0:
+        hy_rows = [r for r in results if r.get("hybrid_outcome") is not None]
+        hy_closed = [r for r in hy_rows if r["hybrid_outcome"] != "pending"]
+        hy_pos = [r for r in hy_closed if (r.get("hybrid_pnl_r") or 0) > 0]
+        hy_r = sum(r.get("hybrid_pnl_r") or 0 for r in hy_closed)
+        # 子集对比:同一样本(baseline 与 hybrid 都闭合)
+        both_closed = [r for r in results if r["outcome"] in ("tp","sl") and r.get("hybrid_outcome") not in (None, "pending")]
+        base_r_on_both = sum(r["pnl_r"] for r in both_closed)
+        hy_r_on_both = sum((r.get("hybrid_pnl_r") or 0) for r in both_closed)
+        print("-" * 100)
+        print(f"[HYBRID TRAIL] TP1={tp1_portion*100:.0f}% + 剩余 peak − {trail_atr_mult}×ATR_4h 追踪")
+        print(f"  全部 n={len(hy_rows)}  闭合={len(hy_closed)}  净正={len(hy_pos)}  ΣR={hy_r:+.2f}")
+        print(f"  同样本对比(两种模式均闭合, n={len(both_closed)}):  Baseline ΣR={base_r_on_both:+.2f}  Hybrid ΣR={hy_r_on_both:+.2f}  Δ={hy_r_on_both - base_r_on_both:+.2f}")
+        # outcome 分布
+        oc = defaultdict(int)
+        for r in hy_rows:
+            oc[r["hybrid_outcome"]] += 1
+        print(f"  Outcome 分布: {dict(oc)}")
+        # NOTIFIED only 对比
+        ntf = [r for r in results if r.get("notified") and r.get("hybrid_outcome") not in (None, "pending")]
+        ntf_base = [r for r in results if r.get("notified") and r["outcome"] in ("tp","sl")]
+        if ntf and ntf_base:
+            b_r = sum(r["pnl_r"] for r in ntf_base)
+            h_r = sum((r.get("hybrid_pnl_r") or 0) for r in ntf)
+            print(f"  NOTIFIED only:  Baseline ΣR={b_r:+.2f} (n={len(ntf_base)})  Hybrid ΣR={h_r:+.2f} (n={len(ntf)})  Δ={h_r - b_r:+.2f}")
     by_dir = defaultdict(lambda: {"n": 0, "w": 0})
     for r in closed:
         by_dir[r["direction"]]["n"] += 1
@@ -590,6 +722,9 @@ def main() -> None:
     ap.add_argument("--rr-min", type=float, default=None, help="覆盖 risk_reward_min")
     ap.add_argument("--inspect", default=None, help="诊断模式:聚焦指定日期 (YYYY-MM-DD),打印该日前后所有信号状态转换")
     ap.add_argument("--export-csv", dest="csv", default=None, help="信号特征 + outcome 导出到 CSV(供 ML 分析)")
+    ap.add_argument("--trail-atr", type=float, default=0.0,
+                    help="启用 hybrid trail:设成 >0(如 1.5),TP1 平仓后剩余按 peak − N×ATR_4h 追踪。0=仅跑 baseline")
+    ap.add_argument("--tp1-portion", type=float, default=0.5, help="hybrid 模式 TP1 平仓比例(0-1)")
     args = ap.parse_args()
 
     with open(ROOT / "config.yaml", "r", encoding="utf-8") as f:
@@ -600,7 +735,8 @@ def main() -> None:
     symbol = args.symbol or cfg["symbol"]
     ref = (cfg.get("reference") or {}).get("symbol")
 
-    asyncio.run(run_backtest(symbol, ref, args.days, cfg, inspect_date=args.inspect, csv_path=args.csv))
+    asyncio.run(run_backtest(symbol, ref, args.days, cfg, inspect_date=args.inspect, csv_path=args.csv,
+                             trail_atr_mult=args.trail_atr, tp1_portion=args.tp1_portion))
 
 
 if __name__ == "__main__":
