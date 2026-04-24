@@ -214,9 +214,15 @@ async def main_async() -> None:
     notifier: Optional[TelegramNotifier] = None
 
     if tg_token and tg_chat:
-        notifier = TelegramNotifier(token=tg_token, chat_id=tg_chat, proxy=tg_proxy)
+        notifier = TelegramNotifier(
+            token=tg_token, chat_id=tg_chat, proxy=tg_proxy,
+            db=db, engine=engine, tz_name=tz_name,
+        )
         await notifier.start()
-        await notifier.send_text("🤖 SMC Bot 已启动，开始监控 ETHUSDT")
+        await notifier.send_text(
+            "🤖 SMC Bot 已启动，开始监控 ETHUSDT\n"
+            "命令: /signals [小时] /active /status /help"
+        )
     else:
         logger.warning("未配置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，通知将只输出到日志")
 

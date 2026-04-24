@@ -192,6 +192,28 @@ class Database:
         )
         await self._conn.commit()
 
+    async def recent_signals(
+        self, hours: int, symbol: Optional[str] = None, limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """返回近 `hours` 小时 notified 信号(按 notified_at 倒序)。"""
+        assert self._conn is not None
+        cutoff = int(time.time()) - hours * 3600
+        sql = (
+            "SELECT signal_id, symbol, direction, entry_price, stop_loss, take_profit, "
+            "risk_reward, total_score, triggered_level, poi_type, "
+            "created_at, notified_at, outcome, pnl_r "
+            "FROM signals WHERE notified_at >= ? "
+        )
+        params: tuple = (cutoff,)
+        if symbol:
+            sql += "AND symbol = ? "
+            params = (cutoff, symbol)
+        sql += "ORDER BY notified_at DESC LIMIT ?"
+        params = (*params, limit)
+        async with self._conn.execute(sql, params) as cur:
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, row)) for row in await cur.fetchall()]
+
     async def set_signal_action(self, signal_id: str, action: str) -> Optional[Dict[str, Any]]:
         """记录用户在 Telegram 的选择：'opened' / 'ignored'。返回信号行（或 None）。"""
         assert self._conn is not None

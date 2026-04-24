@@ -1,23 +1,31 @@
-"""Telegram Bot 异步封装(只发送,不接收用户反馈)。
+"""Telegram Bot 异步封装(双向:推送 signal + 接收命令查询)。
 
 使用 python-telegram-bot>=20.0 的 Application:
 - 外发:`send_signal(s)` 将 SignalState 格式化后推送到 Telegram
-- 不再接入入站回调(持仓门控已移除,用户不需要回传开平仓状态)
+- 入站命令(仅 chat_id 匹配的 message 响应,其余忽略):
+    /signals [hours]  查近 N 小时 notified 信号,默认 6,limit 20
+    /active           列当前 in-flight 信号(Step1~STEP6)
+    /status           bot 状态:最近 1h close 时间、in-flight 计数
+    /help             帮助
 - 所有失败记 error log,不抛出
 - 支持可选 SOCKS5/HTTP 代理
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
 try:
+    import pytz
     from telegram.constants import ParseMode
-    from telegram.ext import Application
+    from telegram.ext import Application, CommandHandler
     from telegram.request import HTTPXRequest
 except ImportError:  # 允许在无依赖环境下 import 模块
     ParseMode = None  # type: ignore[assignment]
     Application = None  # type: ignore[assignment]
+    CommandHandler = None  # type: ignore[assignment]
     HTTPXRequest = None  # type: ignore[assignment]
+    pytz = None  # type: ignore[assignment]
 
 from utils.logger import logger
 
@@ -25,13 +33,16 @@ from notify.formatter import format_signal
 
 
 class TelegramNotifier:
-    """单向 Telegram 发信封装。"""
+    """双向 Telegram 封装:推送 + 命令查询。"""
 
     def __init__(
         self,
         token: str,
         chat_id: str,
         proxy: Optional[str] = None,
+        db: Any = None,
+        engine: Any = None,
+        tz_name: str = "America/New_York",
     ) -> None:
         if not token:
             raise ValueError("TelegramNotifier 需要非空 token")
@@ -41,6 +52,9 @@ class TelegramNotifier:
         self._chat_id = str(chat_id)
         self._proxy = proxy or None
         self._app: Optional[Any] = None
+        self._db = db
+        self._engine = engine
+        self._tz_name = tz_name
 
     async def start(self) -> None:
         if Application is None:
@@ -51,11 +65,21 @@ class TelegramNotifier:
         if self._proxy:
             builder = builder.proxy(self._proxy).get_updates_proxy(self._proxy)
         self._app = builder.build()
+        # 注册命令 handler:仅当 db/engine 至少有一个注入时开启入站
+        if CommandHandler is not None and (self._db is not None or self._engine is not None):
+            self._app.add_handler(CommandHandler("signals", self._cmd_signals))
+            self._app.add_handler(CommandHandler("active", self._cmd_active))
+            self._app.add_handler(CommandHandler("status", self._cmd_status))
+            self._app.add_handler(CommandHandler("help", self._cmd_help))
+            self._app.add_handler(CommandHandler("start", self._cmd_help))
         try:
             await self._app.initialize()
             await self._app.start()
+            # start_polling 开启 updater 接收用户消息
+            if self._app.updater is not None:
+                await self._app.updater.start_polling(drop_pending_updates=True)
             me = await self._app.bot.get_me()
-            logger.info(f"TelegramNotifier 已连接: @{me.username}")
+            logger.info(f"TelegramNotifier 已连接: @{me.username}  (命令接收: 已启用)")
         except Exception as e:  # noqa: BLE001
             logger.error(f"TelegramNotifier 启动失败: {e}")
 
@@ -63,6 +87,8 @@ class TelegramNotifier:
         if self._app is None:
             return
         try:
+            if self._app.updater is not None and self._app.updater.running:
+                await self._app.updater.stop()
             if self._app.running:
                 await self._app.stop()
             await self._app.shutdown()
@@ -95,6 +121,139 @@ class TelegramNotifier:
         except Exception as e:  # noqa: BLE001
             logger.error(f"Telegram 发送失败: {e}")
             return False
+
+    # ---- 命令 handlers(仅自己 chat 可调) ---------------------------------
+
+    def _is_authorized(self, update: Any) -> bool:
+        """只允许配置的 chat_id 调用命令,防止别人骚扰。"""
+        chat = getattr(update, "effective_chat", None)
+        if chat is None:
+            return False
+        return str(chat.id) == self._chat_id
+
+    def _fmt_ts(self, ts: Optional[int]) -> str:
+        if ts is None:
+            return "-"
+        try:
+            tz = pytz.timezone(self._tz_name) if pytz is not None else timezone.utc
+            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc).astimezone(tz)
+            return dt.strftime("%m-%d %H:%M")
+        except Exception:  # noqa: BLE001
+            return str(ts)
+
+    async def _cmd_signals(self, update: Any, context: Any) -> None:
+        if not self._is_authorized(update):
+            return
+        if self._db is None:
+            await update.message.reply_text("DB 未接入,无法查询")
+            return
+        hours = 6
+        if context.args:
+            try:
+                hours = max(1, min(int(context.args[0]), 168))
+            except ValueError:
+                pass
+        rows = await self._db.recent_signals(hours=hours, limit=20)
+        if not rows:
+            await update.message.reply_text(f"近 {hours}h 无 notified 信号")
+            return
+        lines = [f"*近 {hours}h 信号* ({len(rows)} 条)\n"]
+        for r in rows:
+            t = self._fmt_ts(r.get("notified_at"))
+            dir_ = r.get("direction", "?")
+            src = r.get("triggered_level") or r.get("poi_type") or "-"
+            entry = r.get("entry_price")
+            sl = r.get("stop_loss")
+            tp = r.get("take_profit")
+            rr = r.get("risk_reward")
+            score = r.get("total_score")
+            outcome = r.get("outcome") or "open"
+            pnl = r.get("pnl_r")
+            pnl_str = f" {pnl:+.2f}R" if pnl is not None else ""
+            lines.append(
+                f"`{t}` {dir_:<5} {src}\n"
+                f"  E={entry} SL={sl} TP={tp}  RR={rr}  score={score}  [{outcome}]{pnl_str}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def _cmd_active(self, update: Any, context: Any) -> None:
+        if not self._is_authorized(update):
+            return
+        if self._engine is None:
+            await update.message.reply_text("engine 未接入,无法查询")
+            return
+        active = getattr(self._engine, "active_signals", {}) or {}
+        # 只看 in-flight:Step1~Step6,跳过 NOTIFIED/EXPIRED/INVALIDATED
+        in_flight = []
+        for sid, s in active.items():
+            step = getattr(s.step, "value", str(s.step))
+            if step in ("NOTIFIED", "EXPIRED", "INVALIDATED"):
+                continue
+            in_flight.append((sid, s, step))
+        if not in_flight:
+            await update.message.reply_text("当前无 in-flight 信号")
+            return
+        lines = [f"*in-flight 信号* ({len(in_flight)} 条)\n"]
+        for sid, s, step in in_flight[:20]:
+            poi_src = getattr(s, "poi_source", None) or "-"
+            direction = getattr(s, "direction", "?")
+            poi_low = getattr(s, "poi_low", None)
+            poi_high = getattr(s, "poi_high", None)
+            poi_range = f"[{poi_low}-{poi_high}]" if poi_low is not None else "-"
+            lines.append(
+                f"`{sid[:8]}` {direction:<5} {step:<16}\n"
+                f"  src={poi_src}  POI={poi_range}"
+            )
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def _cmd_status(self, update: Any, context: Any) -> None:
+        if not self._is_authorized(update):
+            return
+        parts = ["*Bot 状态*\n"]
+        if self._engine is not None:
+            active = getattr(self._engine, "active_signals", {}) or {}
+            by_step: dict = {}
+            for s in active.values():
+                step = getattr(s.step, "value", str(s.step))
+                by_step[step] = by_step.get(step, 0) + 1
+            parts.append(f"active_signals: {len(active)}")
+            if by_step:
+                parts.append(f"  分布: {by_step}")
+            candles = getattr(self._engine, "candles", None)
+            if candles is not None:
+                for tf in ("15m", "1h", "4h"):
+                    try:
+                        last = candles.last(getattr(self._engine, "symbol", "ETHUSDT") or "ETHUSDT", tf)
+                        if last is not None:
+                            parts.append(f"最近 {tf} close: {self._fmt_ts(last.close_time // 1000)}  C={last.close}")
+                    except Exception:  # noqa: BLE001
+                        pass
+        if self._db is not None:
+            try:
+                rows = await self._db.recent_signals(hours=24, limit=1)
+                if rows:
+                    r0 = rows[0]
+                    parts.append(
+                        f"最近 notified: {self._fmt_ts(r0.get('notified_at'))} "
+                        f"{r0.get('direction')} {r0.get('triggered_level')}"
+                    )
+                else:
+                    parts.append("最近 24h: 0 条 notified")
+            except Exception as e:  # noqa: BLE001
+                parts.append(f"DB 查询异常: {e}")
+        await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+
+    async def _cmd_help(self, update: Any, context: Any) -> None:
+        if not self._is_authorized(update):
+            return
+        await update.message.reply_text(
+            "*SMC Bot 命令*\n\n"
+            "`/signals [小时]`  查近 N 小时 notified 信号(默认 6,最多 168)\n"
+            "`/active`          列当前 in-flight 信号\n"
+            "`/status`          Bot 状态 + 最近 K 线时间\n"
+            "`/help`            显示帮助",
+            parse_mode="Markdown",
+        )
 
 
 __all__ = ["TelegramNotifier"]
