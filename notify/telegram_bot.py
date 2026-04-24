@@ -201,13 +201,21 @@ class TelegramNotifier:
                 hours = max(1, min(int(context.args[0]), 168))
             except ValueError:
                 pass
-        rows = await self._db.recent_signals(hours=hours, limit=20)
+        rows = await self._db.recent_signals(hours=hours, limit=20, include_scored=True)
         if not rows:
-            await update.message.reply_text(f"近 {hours}h 无 notified 信号")
+            await update.message.reply_text(f"近 {hours}h 无 SCORED/NOTIFIED 信号")
             return
-        lines = [f"<b>近 {hours}h 信号</b> ({len(rows)} 条)\n"]
+        n_notified = sum(1 for r in rows if r.get("notified_at"))
+        n_scored_only = len(rows) - n_notified
+        lines = [
+            f"<b>近 {hours}h 信号</b>  共 {len(rows)} 条  "
+            f"(notified={n_notified} / scored-only={n_scored_only})\n"
+        ]
         for r in rows:
-            t = self._fmt_ts(r.get("notified_at"))
+            # 时间用最新事件:notified_at 优先,否则 scored_at
+            ts = r.get("notified_at") or r.get("scored_at")
+            t = self._fmt_ts(ts)
+            tag = "🟢 notified" if r.get("notified_at") else "🟡 scored"
             dir_ = r.get("direction", "?")
             src = r.get("triggered_level") or r.get("poi_type") or "-"
             entry = r.get("entry_price")
@@ -219,7 +227,7 @@ class TelegramNotifier:
             pnl = r.get("pnl_r")
             pnl_str = f" {pnl:+.2f}R" if pnl is not None else ""
             lines.append(
-                f"<code>{_html_escape(t)}</code> {_html_escape(dir_)} {_html_escape(src)}\n"
+                f"<code>{_html_escape(t)}</code> {tag} {_html_escape(dir_)} {_html_escape(src)}\n"
                 f"  E={entry} SL={sl} TP={tp}  RR={rr}  score={score}  [{_html_escape(outcome)}]{pnl_str}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")

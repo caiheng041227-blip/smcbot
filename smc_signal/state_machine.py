@@ -80,6 +80,7 @@ class SignalState:
     updated_at: int = field(default_factory=lambda: int(time.time()))
     expires_at: int = 0
     notification_sent: bool = False
+    scored_persisted: bool = False  # 已写入 DB(SCORED 时落盘,无论是否过 threshold)
 
 
 # -------- engine -------------------------------------------------------------

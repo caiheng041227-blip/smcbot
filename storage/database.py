@@ -89,6 +89,11 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         for stmt in SCHEMA:
             await self._conn.execute(stmt)
+        # 增量迁移:scored_at 列(2026-04-23 加,旧库无)
+        async with self._conn.execute("PRAGMA table_info(signals)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "scored_at" not in cols:
+            await self._conn.execute("ALTER TABLE signals ADD COLUMN scored_at INTEGER")
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -155,22 +160,24 @@ class Database:
     # ---- signals / positions ----------------------------------------------
 
     async def insert_signal(self, s: Any) -> None:
-        """把 SignalState 快照写入 signals 表；重复 signal_id 幂等更新。"""
+        """NOTIFIED 信号写入(也补 scored_at,如尚未填)。重复 signal_id 幂等。"""
         assert self._conn is not None
+        now = int(time.time())
         await self._conn.execute(
             """
             INSERT INTO signals (
                 signal_id, symbol, direction,
                 entry_price, stop_loss, take_profit, risk_reward,
                 total_score, triggered_level, poi_type, poi_low, poi_high,
-                created_at, notified_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                created_at, scored_at, notified_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(signal_id) DO UPDATE SET
                 entry_price=excluded.entry_price,
                 stop_loss=excluded.stop_loss,
                 take_profit=excluded.take_profit,
                 risk_reward=excluded.risk_reward,
                 total_score=excluded.total_score,
+                scored_at=COALESCE(scored_at, excluded.scored_at),
                 notified_at=excluded.notified_at
             """,
             (
@@ -186,29 +193,80 @@ class Database:
                 getattr(s, "poi_type", None),
                 getattr(s, "poi_low", None),
                 getattr(s, "poi_high", None),
-                getattr(s, "created_at", int(time.time())),
-                int(time.time()),
+                getattr(s, "created_at", now),
+                now,  # scored_at
+                now,  # notified_at
+            ),
+        )
+        await self._conn.commit()
+
+    async def upsert_signal_scored(self, s: Any) -> None:
+        """SCORED 信号落盘(无论是否过 threshold)。notified_at 留 NULL,后续若 NOTIFIED 时由 insert_signal 补上。"""
+        assert self._conn is not None
+        now = int(time.time())
+        await self._conn.execute(
+            """
+            INSERT INTO signals (
+                signal_id, symbol, direction,
+                entry_price, stop_loss, take_profit, risk_reward,
+                total_score, triggered_level, poi_type, poi_low, poi_high,
+                created_at, scored_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+                entry_price=excluded.entry_price,
+                stop_loss=excluded.stop_loss,
+                take_profit=excluded.take_profit,
+                risk_reward=excluded.risk_reward,
+                total_score=excluded.total_score,
+                scored_at=COALESCE(scored_at, excluded.scored_at)
+            """,
+            (
+                getattr(s, "signal_id"),
+                getattr(s, "symbol"),
+                getattr(s, "direction"),
+                getattr(s, "entry_price", None),
+                getattr(s, "stop_loss", None),
+                getattr(s, "take_profit", None),
+                getattr(s, "risk_reward", None),
+                getattr(s, "total_score", None),
+                getattr(s, "triggered_level", None),
+                getattr(s, "poi_type", None),
+                getattr(s, "poi_low", None),
+                getattr(s, "poi_high", None),
+                getattr(s, "created_at", now),
+                now,
             ),
         )
         await self._conn.commit()
 
     async def recent_signals(
         self, hours: int, symbol: Optional[str] = None, limit: int = 50,
+        include_scored: bool = True,
     ) -> List[Dict[str, Any]]:
-        """返回近 `hours` 小时 notified 信号(按 notified_at 倒序)。"""
+        """返回近 `hours` 小时信号。
+
+        - include_scored=True(默认):同时包含 SCORED(notified_at=NULL)和 NOTIFIED 两类
+        - include_scored=False:仅 NOTIFIED(原行为)
+
+        排序依据 = COALESCE(notified_at, scored_at)倒序。
+        """
         assert self._conn is not None
         cutoff = int(time.time()) - hours * 3600
+        if include_scored:
+            where = "WHERE COALESCE(notified_at, scored_at) >= ? "
+        else:
+            where = "WHERE notified_at >= ? "
         sql = (
             "SELECT signal_id, symbol, direction, entry_price, stop_loss, take_profit, "
             "risk_reward, total_score, triggered_level, poi_type, "
-            "created_at, notified_at, outcome, pnl_r "
-            "FROM signals WHERE notified_at >= ? "
+            "created_at, scored_at, notified_at, outcome, pnl_r "
+            "FROM signals " + where
         )
         params: tuple = (cutoff,)
         if symbol:
             sql += "AND symbol = ? "
             params = (cutoff, symbol)
-        sql += "ORDER BY notified_at DESC LIMIT ?"
+        sql += "ORDER BY COALESCE(notified_at, scored_at) DESC LIMIT ?"
         params = (*params, limit)
         async with self._conn.execute(sql, params) as cur:
             cols = [c[0] for c in cur.description]

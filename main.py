@@ -278,15 +278,25 @@ async def main_async() -> None:
     candles.subscribe_close(on_candle_close)
 
     async def notify_loop():
+        from smc_signal.state_machine import SignalStep as _SS
         while True:
             try:
+                # 1. 先把所有 SCORED 信号(无论是否过 threshold)落盘 → /signals 命令能查到
+                for sid, s in list(engine.active_signals.items()):
+                    if s.step == _SS.SCORED and not getattr(s, "scored_persisted", False):
+                        try:
+                            await db.upsert_signal_scored(s)
+                            s.scored_persisted = True
+                        except Exception as e:  # noqa: BLE001
+                            logger.error(f"落盘 SCORED 信号失败 {sid[:8]}: {e}")
+                # 2. 推送过 threshold 的信号
                 for s in engine.get_notification_ready():
                     logger.success(
                         f"[SIGNAL READY] {s.symbol} {s.direction} "
                         f"entry={s.entry_price} SL={s.stop_loss} TP={s.take_profit} "
                         f"RR={s.risk_reward:.2f} score={s.total_score}"
                     )
-                    # 先落盘,再发通知 —— 保证按钮回调永远能查到 signal 行
+                    # 先落盘(补 notified_at),再发通知
                     await db.insert_signal(s)
                     # GBrain 旁路记录(sync, 永不 raise, 失败只 warn)
                     gbrain_log_signal(s, source="live")
