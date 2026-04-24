@@ -17,15 +17,44 @@ from typing import Any, Callable, Optional
 
 try:
     import pytz
+    from telegram import KeyboardButton, ReplyKeyboardMarkup
     from telegram.constants import ParseMode
-    from telegram.ext import Application, CommandHandler
+    from telegram.ext import Application, CommandHandler, MessageHandler, filters
     from telegram.request import HTTPXRequest
 except ImportError:  # 允许在无依赖环境下 import 模块
     ParseMode = None  # type: ignore[assignment]
     Application = None  # type: ignore[assignment]
     CommandHandler = None  # type: ignore[assignment]
+    MessageHandler = None  # type: ignore[assignment]
+    KeyboardButton = None  # type: ignore[assignment]
+    ReplyKeyboardMarkup = None  # type: ignore[assignment]
+    filters = None  # type: ignore[assignment]
     HTTPXRequest = None  # type: ignore[assignment]
     pytz = None  # type: ignore[assignment]
+
+
+# 按钮文字 → 对应命令映射(点击时 bot 收到的是文本)
+_BTN_6H = "📊 近 6h"
+_BTN_24H = "📊 近 24h"
+_BTN_3D = "📊 近 3 天"
+_BTN_ACTIVE = "⏳ in-flight"
+_BTN_STATUS = "🔧 状态"
+_BTN_HELP = "❓ 帮助"
+
+
+def _build_reply_keyboard() -> Any:
+    """持久化底部键盘(tap = send text)。"""
+    if ReplyKeyboardMarkup is None or KeyboardButton is None:
+        return None
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(_BTN_6H), KeyboardButton(_BTN_24H), KeyboardButton(_BTN_3D)],
+            [KeyboardButton(_BTN_ACTIVE), KeyboardButton(_BTN_STATUS), KeyboardButton(_BTN_HELP)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="点按钮或输入 /signals 12",
+    )
 
 from utils.logger import logger
 
@@ -65,13 +94,18 @@ class TelegramNotifier:
         if self._proxy:
             builder = builder.proxy(self._proxy).get_updates_proxy(self._proxy)
         self._app = builder.build()
-        # 注册命令 handler:仅当 db/engine 至少有一个注入时开启入站
+        # 注册命令 + 按钮 handler:仅当 db/engine 至少有一个注入时开启入站
         if CommandHandler is not None and (self._db is not None or self._engine is not None):
             self._app.add_handler(CommandHandler("signals", self._cmd_signals))
             self._app.add_handler(CommandHandler("active", self._cmd_active))
             self._app.add_handler(CommandHandler("status", self._cmd_status))
             self._app.add_handler(CommandHandler("help", self._cmd_help))
             self._app.add_handler(CommandHandler("start", self._cmd_help))
+            # 文本按钮(ReplyKeyboard 点击后发来的是纯文本)
+            if MessageHandler is not None and filters is not None:
+                self._app.add_handler(
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text)
+                )
         try:
             await self._app.initialize()
             await self._app.start()
@@ -106,17 +140,23 @@ class TelegramNotifier:
             return False
         return await self.send_text(text)
 
-    async def send_text(self, text: str) -> bool:
+    async def send_text(self, text: str, with_keyboard: bool = False) -> bool:
+        """发送文本。`with_keyboard=True` 时附带持久化按钮(启动消息用)。"""
         if self._app is None or self._app.bot is None:
             logger.error("TelegramNotifier 未初始化")
             return False
         try:
-            await self._app.bot.send_message(
-                chat_id=self._chat_id,
-                text=text,
-                parse_mode=ParseMode.MARKDOWN if ParseMode is not None else "Markdown",
-                disable_web_page_preview=True,
-            )
+            kwargs: dict = {
+                "chat_id": self._chat_id,
+                "text": text,
+                "parse_mode": ParseMode.MARKDOWN if ParseMode is not None else "Markdown",
+                "disable_web_page_preview": True,
+            }
+            if with_keyboard:
+                kb = _build_reply_keyboard()
+                if kb is not None:
+                    kwargs["reply_markup"] = kb
+            await self._app.bot.send_message(**kwargs)
             return True
         except Exception as e:  # noqa: BLE001
             logger.error(f"Telegram 发送失败: {e}")
@@ -246,14 +286,40 @@ class TelegramNotifier:
     async def _cmd_help(self, update: Any, context: Any) -> None:
         if not self._is_authorized(update):
             return
+        kb = _build_reply_keyboard()
         await update.message.reply_text(
             "*SMC Bot 命令*\n\n"
-            "`/signals [小时]`  查近 N 小时 notified 信号(默认 6,最多 168)\n"
+            "👇 **点下方按钮**(推荐) 或输入 /命令\n\n"
+            "`/signals [小时]`  查近 N 小时 notified(默认 6,最多 168)\n"
             "`/active`          列当前 in-flight 信号\n"
             "`/status`          Bot 状态 + 最近 K 线时间\n"
             "`/help`            显示帮助",
             parse_mode="Markdown",
+            reply_markup=kb,
         )
+
+    async def _on_text(self, update: Any, context: Any) -> None:
+        """处理按钮点击(ReplyKeyboard 发来的是纯文本)。"""
+        if not self._is_authorized(update):
+            return
+        text = (update.message.text or "").strip()
+        # 模拟 context.args 以复用命令 handler
+        if _BTN_6H in text:
+            context.args = ["6"]
+            await self._cmd_signals(update, context)
+        elif _BTN_24H in text:
+            context.args = ["24"]
+            await self._cmd_signals(update, context)
+        elif _BTN_3D in text:
+            context.args = ["72"]
+            await self._cmd_signals(update, context)
+        elif _BTN_ACTIVE in text:
+            await self._cmd_active(update, context)
+        elif _BTN_STATUS in text:
+            await self._cmd_status(update, context)
+        elif _BTN_HELP in text:
+            await self._cmd_help(update, context)
+        # 其它文本:沉默忽略(别人发别的话也不响应)
 
 
 __all__ = ["TelegramNotifier"]

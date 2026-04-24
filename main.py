@@ -220,8 +220,9 @@ async def main_async() -> None:
         )
         await notifier.start()
         await notifier.send_text(
-            "🤖 SMC Bot 已启动，开始监控 ETHUSDT\n"
-            "命令: /signals [小时] /active /status /help"
+            "🤖 SMC Bot 已启动，开始监控 ETHUSDT\n\n"
+            "👇 点下方按钮查询,或输入 /help 看命令",
+            with_keyboard=True,
         )
     else:
         logger.warning("未配置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，通知将只输出到日志")
