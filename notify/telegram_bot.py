@@ -288,16 +288,22 @@ class TelegramNotifier:
                         pass
         if self._db is not None:
             try:
-                rows = await self._db.recent_signals(hours=24, limit=1)
+                rows = await self._db.recent_signals(hours=24, limit=1, include_scored=True)
                 if rows:
                     r0 = rows[0]
+                    if r0.get("notified_at"):
+                        tag = "🟢 notified"
+                        ts = r0.get("notified_at")
+                    else:
+                        tag = "🟡 scored(未达 threshold)"
+                        ts = r0.get("scored_at")
                     parts.append(
-                        f"最近 notified: {self._fmt_ts(r0.get('notified_at'))} "
+                        f"最近信号: {tag}  {self._fmt_ts(ts)}  "
                         f"{_html_escape(r0.get('direction') or '-')} "
-                        f"{_html_escape(r0.get('triggered_level') or '-')}"
+                        f"{_html_escape(r0.get('triggered_level') or r0.get('poi_type') or '-')}"
                     )
                 else:
-                    parts.append("最近 24h: 0 条 notified")
+                    parts.append("最近 24h: 0 条信号(SCORED 和 NOTIFIED 都没)")
             except Exception as e:  # noqa: BLE001
                 parts.append(f"DB 查询异常: {_html_escape(str(e))}")
         await update.message.reply_text("\n".join(parts), parse_mode="HTML")
