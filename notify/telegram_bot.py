@@ -61,6 +61,14 @@ from utils.logger import logger
 from notify.formatter import format_signal
 
 
+def _html_escape(s: Any) -> str:
+    """TG HTML 模式只需要转义 < > &"""
+    if s is None:
+        return ""
+    text = str(s)
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 class TelegramNotifier:
     """双向 Telegram 封装:推送 + 命令查询。"""
 
@@ -197,7 +205,7 @@ class TelegramNotifier:
         if not rows:
             await update.message.reply_text(f"近 {hours}h 无 notified 信号")
             return
-        lines = [f"*近 {hours}h 信号* ({len(rows)} 条)\n"]
+        lines = [f"<b>近 {hours}h 信号</b> ({len(rows)} 条)\n"]
         for r in rows:
             t = self._fmt_ts(r.get("notified_at"))
             dir_ = r.get("direction", "?")
@@ -211,10 +219,10 @@ class TelegramNotifier:
             pnl = r.get("pnl_r")
             pnl_str = f" {pnl:+.2f}R" if pnl is not None else ""
             lines.append(
-                f"`{t}` {dir_:<5} {src}\n"
-                f"  E={entry} SL={sl} TP={tp}  RR={rr}  score={score}  [{outcome}]{pnl_str}"
+                f"<code>{_html_escape(t)}</code> {_html_escape(dir_)} {_html_escape(src)}\n"
+                f"  E={entry} SL={sl} TP={tp}  RR={rr}  score={score}  [{_html_escape(outcome)}]{pnl_str}"
             )
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _cmd_active(self, update: Any, context: Any) -> None:
         if not self._is_authorized(update):
@@ -223,7 +231,6 @@ class TelegramNotifier:
             await update.message.reply_text("engine 未接入,无法查询")
             return
         active = getattr(self._engine, "active_signals", {}) or {}
-        # 只看 in-flight:Step1~Step6,跳过 NOTIFIED/EXPIRED/INVALIDATED
         in_flight = []
         for sid, s in active.items():
             step = getattr(s.step, "value", str(s.step))
@@ -233,7 +240,7 @@ class TelegramNotifier:
         if not in_flight:
             await update.message.reply_text("当前无 in-flight 信号")
             return
-        lines = [f"*in-flight 信号* ({len(in_flight)} 条)\n"]
+        lines = [f"<b>in-flight 信号</b> ({len(in_flight)} 条)\n"]
         for sid, s, step in in_flight[:20]:
             poi_src = getattr(s, "poi_source", None) or "-"
             direction = getattr(s, "direction", "?")
@@ -241,15 +248,16 @@ class TelegramNotifier:
             poi_high = getattr(s, "poi_high", None)
             poi_range = f"[{poi_low}-{poi_high}]" if poi_low is not None else "-"
             lines.append(
-                f"`{sid[:8]}` {direction:<5} {step:<16}\n"
-                f"  src={poi_src}  POI={poi_range}"
+                f"<code>{_html_escape(sid[:8])}</code> {_html_escape(direction)} "
+                f"{_html_escape(step)}\n"
+                f"  src={_html_escape(poi_src)}  POI={_html_escape(poi_range)}"
             )
-        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _cmd_status(self, update: Any, context: Any) -> None:
         if not self._is_authorized(update):
             return
-        parts = ["*Bot 状态*\n"]
+        parts = ["<b>Bot 状态</b>\n"]
         if self._engine is not None:
             active = getattr(self._engine, "active_signals", {}) or {}
             by_step: dict = {}
@@ -258,7 +266,9 @@ class TelegramNotifier:
                 by_step[step] = by_step.get(step, 0) + 1
             parts.append(f"active_signals: {len(active)}")
             if by_step:
-                parts.append(f"  分布: {by_step}")
+                # 手动格式化,避免 dict repr 的引号/括号破坏 HTML 解析
+                dist_str = ", ".join(f"{k}={v}" for k, v in by_step.items())
+                parts.append(f"  分布: {_html_escape(dist_str)}")
             candles = getattr(self._engine, "candles", None)
             if candles is not None:
                 for tf in ("15m", "1h", "4h"):
@@ -275,26 +285,27 @@ class TelegramNotifier:
                     r0 = rows[0]
                     parts.append(
                         f"最近 notified: {self._fmt_ts(r0.get('notified_at'))} "
-                        f"{r0.get('direction')} {r0.get('triggered_level')}"
+                        f"{_html_escape(r0.get('direction') or '-')} "
+                        f"{_html_escape(r0.get('triggered_level') or '-')}"
                     )
                 else:
                     parts.append("最近 24h: 0 条 notified")
             except Exception as e:  # noqa: BLE001
-                parts.append(f"DB 查询异常: {e}")
-        await update.message.reply_text("\n".join(parts), parse_mode="Markdown")
+                parts.append(f"DB 查询异常: {_html_escape(str(e))}")
+        await update.message.reply_text("\n".join(parts), parse_mode="HTML")
 
     async def _cmd_help(self, update: Any, context: Any) -> None:
         if not self._is_authorized(update):
             return
         kb = _build_reply_keyboard()
         await update.message.reply_text(
-            "*SMC Bot 命令*\n\n"
-            "👇 **点下方按钮**(推荐) 或输入 /命令\n\n"
-            "`/signals [小时]`  查近 N 小时 notified(默认 6,最多 168)\n"
-            "`/active`          列当前 in-flight 信号\n"
-            "`/status`          Bot 状态 + 最近 K 线时间\n"
-            "`/help`            显示帮助",
-            parse_mode="Markdown",
+            "<b>SMC Bot 命令</b>\n\n"
+            "👇 <b>点下方按钮</b>(推荐) 或输入 /命令\n\n"
+            "<code>/signals [小时]</code>  查近 N 小时 notified(默认 6,最多 168)\n"
+            "<code>/active</code>          列当前 in-flight 信号\n"
+            "<code>/status</code>          Bot 状态 + 最近 K 线时间\n"
+            "<code>/help</code>            显示帮助",
+            parse_mode="HTML",
             reply_markup=kb,
         )
 
