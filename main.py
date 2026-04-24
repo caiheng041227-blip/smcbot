@@ -14,7 +14,7 @@ import os
 import signal
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import pytz
 import yaml
@@ -46,6 +46,7 @@ async def replay_recent_state(
     weekly_vp: WeeklyVolumeProfileSession,
     levels: KeyLevels,
     proxy: Optional[str] = None,
+    db: Optional[Any] = None,
 ) -> None:
     """重启后回放近 N 小时历史,重建 state_machine 的 active_signals + VP/levels。
 
@@ -107,8 +108,17 @@ async def replay_recent_state(
 
     suppressed = 0
     alive_by_step: dict = {}
+    persisted = 0
     for sid, s in list(engine.active_signals.items()):
         if s.step == SignalStep.SCORED:
+            # 落盘(在抑制 notification 之前):/signals 命令能查到回放期 SCORED 信号
+            if db is not None:
+                try:
+                    await db.upsert_signal_scored(s)
+                    s.scored_persisted = True
+                    persisted += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"replay 落盘 SCORED 信号失败 {sid[:8]}: {e}")
             s.notification_sent = True
             s.step = SignalStep.NOTIFIED
             suppressed += 1
@@ -117,7 +127,7 @@ async def replay_recent_state(
 
     logger.info(
         f"replay 完成: 处理 {replayed} close 事件 (cutoff={hours}h), "
-        f"抑制 {suppressed} 条过期 SCORED, 保留 in-flight: {alive_by_step}"
+        f"抑制 {suppressed} 条过期 SCORED(落盘 {persisted}), 保留 in-flight: {alive_by_step}"
     )
 
 
@@ -265,6 +275,7 @@ async def main_async() -> None:
                 weekly_vp=weekly_vp,
                 levels=levels,
                 proxy=bf_proxy,
+                db=db,
             )
         else:
             # 回放关闭时退回原纯回填行为
