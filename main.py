@@ -31,6 +31,7 @@ from engine.market_structure import classify_structure
 from engine.volume_profile import VolumeProfileSession, WeeklyVolumeProfileSession
 from gbrain_integration.logger import log_signal as gbrain_log_signal
 from notify import TelegramNotifier
+from notify.signal_tracker import SignalTracker
 from smc_signal import SignalEngine, score as signal_score
 from smc_signal.state_machine import SignalStep
 from storage.database import Database
@@ -223,12 +224,18 @@ async def main_async() -> None:
     tg_proxy = os.getenv("TELEGRAM_PROXY") or None
     notifier: Optional[TelegramNotifier] = None
 
+    # Signal tracker(advisory TP1/TP2/SL 监视,不下单)
+    tracker = SignalTracker(db=db, notifier=None, symbol=symbol,
+                            trail_mult=1.5, tp1_portion=0.5)
+    await tracker.start()
+
     if tg_token and tg_chat:
         notifier = TelegramNotifier(
             token=tg_token, chat_id=tg_chat, proxy=tg_proxy,
-            db=db, engine=engine, tz_name=tz_name,
+            db=db, engine=engine, tracker=tracker, tz_name=tz_name,
         )
         await notifier.start()
+        tracker.notifier = notifier  # 双向绑定,让 tracker 能发 TG 提醒
         await notifier.send_text(
             "🤖 SMC Bot 已启动，开始监控 ETHUSDT\n\n"
             "👇 点下方按钮查询,或输入 /help 看命令",
@@ -256,6 +263,9 @@ async def main_async() -> None:
         )
         if is_main:
             asyncio.create_task(engine.on_candle_close(sym, tf, c))
+            # 仓位追踪:在 15m 收盘扫描所有 open tracker 的 TP1/SL/Trail 条件
+            if tf == "15m":
+                asyncio.create_task(tracker.on_candle(sym, c))
 
     # REST 回填 + 状态回放:在订阅 close 回调之前灌入历史数据,并用近 N 小时
     # 的 K 线重放驱动 state_machine,恢复 active_signals(Step1/2/3/5 in-flight)。
@@ -313,6 +323,12 @@ async def main_async() -> None:
                     gbrain_log_signal(s, source="live")
                     if notifier:
                         await notifier.send_signal(s, with_actions=False)
+                    # 注册到 tracker:监视 TP1 / TP2-trail / SL
+                    try:
+                        atr_4h = engine._atr(s.symbol, "4h")
+                        await tracker.add(s, atr_4h)
+                    except Exception as e:  # noqa: BLE001
+                        logger.error(f"tracker.add 失败 {s.signal_id[:8]}: {e}")
             except Exception as e:
                 logger.error(f"notify_loop 异常: {e}")
             await asyncio.sleep(5)

@@ -227,7 +227,13 @@ def format_signal(signal: Any) -> str:
             trade_lines.append(f"• 盈亏比: 1:{float(risk_reward):.1f}")
         except (TypeError, ValueError):
             pass
-    trade_lines.append("• 止损 / 目标由你自行判断")
+    # 2026-04-23:推送 TP1 + trail 指引(bot 追踪器会在 TP1/TP2/SL 命中时继续发提醒)
+    if take_profit is not None and entry_price is not None and stop_loss is not None:
+        trade_lines.append(f"• TP1(建议平 50%): {_fmt_price(take_profit)}")
+        trade_lines.append("• TP2(剩余 50%): 达 TP1 后启用 peak − 1.5×ATR_4h 移动止盈")
+        trade_lines.append("• bot 会在 TP1 / TP2 / SL 命中时发 TG 提醒")
+    else:
+        trade_lines.append("• 止损 / 目标由你自行判断")
 
     lines = [
         f"{emoji} {direction_cn} | {symbol} | 评分: {score_str}/10",

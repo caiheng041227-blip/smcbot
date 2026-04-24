@@ -76,6 +76,26 @@ SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_positions_symbol_status ON positions(symbol, status)",
+    """
+    CREATE TABLE IF NOT EXISTS signal_trackers (
+        signal_id      TEXT PRIMARY KEY,
+        symbol         TEXT NOT NULL,
+        direction      TEXT NOT NULL,
+        entry          REAL NOT NULL,
+        sl             REAL NOT NULL,
+        tp1            REAL NOT NULL,
+        atr_4h         REAL,
+        trail_mult     REAL,
+        tp1_portion    REAL,
+        created_at     INTEGER,
+        tp1_hit_at     INTEGER,
+        tp1_hit_price  REAL,
+        peak           REAL,
+        closed_at      INTEGER,
+        close_reason   TEXT        -- 'sl' / 'tp2' / 'tp1_then_sl' / 'manual'
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_trackers_closed ON signal_trackers(closed_at)",
 ]
 
 
@@ -269,6 +289,47 @@ class Database:
         sql += "ORDER BY COALESCE(notified_at, scored_at) DESC LIMIT ?"
         params = (*params, limit)
         async with self._conn.execute(sql, params) as cur:
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, row)) for row in await cur.fetchall()]
+
+    # ---- signal_trackers ---------------------------------------------------
+
+    async def upsert_tracker(self, t: Any) -> None:
+        """写入/更新 signal_trackers 行。t 是 Tracker dataclass,按字段名读取。"""
+        assert self._conn is not None
+        await self._conn.execute(
+            """
+            INSERT INTO signal_trackers (
+                signal_id, symbol, direction, entry, sl, tp1,
+                atr_4h, trail_mult, tp1_portion,
+                created_at, tp1_hit_at, tp1_hit_price, peak,
+                closed_at, close_reason
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(signal_id) DO UPDATE SET
+                atr_4h=excluded.atr_4h,
+                trail_mult=excluded.trail_mult,
+                tp1_portion=excluded.tp1_portion,
+                tp1_hit_at=excluded.tp1_hit_at,
+                tp1_hit_price=excluded.tp1_hit_price,
+                peak=excluded.peak,
+                closed_at=excluded.closed_at,
+                close_reason=excluded.close_reason
+            """,
+            (
+                t.signal_id, t.symbol, t.direction, t.entry, t.sl, t.tp1,
+                t.atr_4h, t.trail_mult, t.tp1_portion,
+                t.created_at, t.tp1_hit_at, t.tp1_hit_price, t.peak,
+                t.closed_at, t.close_reason,
+            ),
+        )
+        await self._conn.commit()
+
+    async def load_open_trackers(self) -> List[Dict[str, Any]]:
+        """加载所有未闭合 tracker。重启后调用以恢复状态。"""
+        assert self._conn is not None
+        async with self._conn.execute(
+            "SELECT * FROM signal_trackers WHERE closed_at IS NULL"
+        ) as cur:
             cols = [c[0] for c in cur.description]
             return [dict(zip(cols, row)) for row in await cur.fetchall()]
 

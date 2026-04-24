@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 try:
     import pytz
@@ -79,6 +79,7 @@ class TelegramNotifier:
         proxy: Optional[str] = None,
         db: Any = None,
         engine: Any = None,
+        tracker: Any = None,
         tz_name: str = "America/New_York",
     ) -> None:
         if not token:
@@ -91,6 +92,7 @@ class TelegramNotifier:
         self._app: Optional[Any] = None
         self._db = db
         self._engine = engine
+        self._tracker = tracker
         self._tz_name = tz_name
 
     async def start(self) -> None:
@@ -107,6 +109,7 @@ class TelegramNotifier:
             self._app.add_handler(CommandHandler("signals", self._cmd_signals))
             self._app.add_handler(CommandHandler("active", self._cmd_active))
             self._app.add_handler(CommandHandler("status", self._cmd_status))
+            self._app.add_handler(CommandHandler("close", self._cmd_close))
             self._app.add_handler(CommandHandler("help", self._cmd_help))
             self._app.add_handler(CommandHandler("start", self._cmd_help))
             # 文本按钮(ReplyKeyboard 点击后发来的是纯文本)
@@ -148,8 +151,16 @@ class TelegramNotifier:
             return False
         return await self.send_text(text)
 
-    async def send_text(self, text: str, with_keyboard: bool = False) -> bool:
-        """发送文本。`with_keyboard=True` 时附带持久化按钮(启动消息用)。"""
+    async def send_text(
+        self,
+        text: str,
+        with_keyboard: bool = False,
+        parse_mode: Optional[str] = "Markdown",
+    ) -> bool:
+        """发送文本。
+        - with_keyboard=True 时附带持久化按钮(启动消息用)
+        - parse_mode=None 时发纯文本(避免 _ / * 踩坑)
+        """
         if self._app is None or self._app.bot is None:
             logger.error("TelegramNotifier 未初始化")
             return False
@@ -157,9 +168,10 @@ class TelegramNotifier:
             kwargs: dict = {
                 "chat_id": self._chat_id,
                 "text": text,
-                "parse_mode": ParseMode.MARKDOWN if ParseMode is not None else "Markdown",
                 "disable_web_page_preview": True,
             }
+            if parse_mode is not None:
+                kwargs["parse_mode"] = parse_mode
             if with_keyboard:
                 kb = _build_reply_keyboard()
                 if kb is not None:
@@ -201,34 +213,77 @@ class TelegramNotifier:
                 hours = max(1, min(int(context.args[0]), 168))
             except ValueError:
                 pass
-        rows = await self._db.recent_signals(hours=hours, limit=20, include_scored=True)
+        rows = await self._db.recent_signals(hours=hours, limit=60, include_scored=True)
         if not rows:
             await update.message.reply_text(f"近 {hours}h 无 SCORED/NOTIFIED 信号")
             return
-        n_notified = sum(1 for r in rows if r.get("notified_at"))
-        n_scored_only = len(rows) - n_notified
-        lines = [
-            f"<b>近 {hours}h 信号</b>  共 {len(rows)} 条  "
-            f"(notified={n_notified} / scored-only={n_scored_only})\n"
-        ]
+        # 折叠:同 (direction, entry, sl, tp) 的信号视为同一交易机会,取最新时间 + 来源列表
+        groups: Dict[tuple, Dict[str, Any]] = {}
         for r in rows:
-            # 时间用最新事件:notified_at 优先,否则 scored_at
-            ts = r.get("notified_at") or r.get("scored_at")
-            t = self._fmt_ts(ts)
-            tag = "🟢 notified" if r.get("notified_at") else "🟡 scored"
+            key = (
+                r.get("direction"),
+                round(float(r.get("entry_price") or 0), 2),
+                round(float(r.get("stop_loss") or 0), 2),
+                round(float(r.get("take_profit") or 0), 2),
+            )
+            ts = r.get("notified_at") or r.get("scored_at") or r.get("created_at")
+            g = groups.get(key)
+            if g is None:
+                groups[key] = {
+                    "row": r, "ts": ts, "count": 1,
+                    "any_notified": bool(r.get("notified_at")),
+                    "sources": set(),
+                    "max_score": float(r.get("total_score") or 0),
+                }
+                src = r.get("triggered_level") or r.get("poi_type")
+                if src:
+                    groups[key]["sources"].add(src)
+            else:
+                g["count"] += 1
+                if ts and (g["ts"] is None or ts > g["ts"]):
+                    g["ts"] = ts
+                    g["row"] = r
+                if r.get("notified_at"):
+                    g["any_notified"] = True
+                src = r.get("triggered_level") or r.get("poi_type")
+                if src:
+                    g["sources"].add(src)
+                if float(r.get("total_score") or 0) > g["max_score"]:
+                    g["max_score"] = float(r.get("total_score") or 0)
+        # 按最新时间排序
+        ordered = sorted(groups.values(), key=lambda g: g["ts"] or 0, reverse=True)
+        n_notified_groups = sum(1 for g in ordered if g["any_notified"])
+        n_scored_groups = len(ordered) - n_notified_groups
+        lines = [
+            f"<b>近 {hours}h 交易机会</b>  {len(ordered)} 单  "
+            f"(notified={n_notified_groups} / scored-only={n_scored_groups})  "
+            f"原始 {len(rows)} 条(已折叠同机会)\n"
+        ]
+        def _num(v: Any, decimals: int = 2) -> str:
+            if isinstance(v, (int, float)):
+                return f"{float(v):.{decimals}f}"
+            return "-"
+
+        for g in ordered[:20]:
+            r = g["row"]
+            t_str = self._fmt_ts(g["ts"])
+            tag = "🟢 notified" if g["any_notified"] else "🟡 scored"
             dir_ = r.get("direction", "?")
-            src = r.get("triggered_level") or r.get("poi_type") or "-"
+            srcs = "/".join(sorted(g["sources"])) or "-"
             entry = r.get("entry_price")
             sl = r.get("stop_loss")
             tp = r.get("take_profit")
             rr = r.get("risk_reward")
-            score = r.get("total_score")
+            score = g["max_score"]
             outcome = r.get("outcome") or "open"
             pnl = r.get("pnl_r")
             pnl_str = f" {pnl:+.2f}R" if pnl is not None else ""
+            dup_str = f" (×{g['count']}源)" if g["count"] > 1 else ""
             lines.append(
-                f"<code>{_html_escape(t)}</code> {tag} {_html_escape(dir_)} {_html_escape(src)}\n"
-                f"  E={entry} SL={sl} TP={tp}  RR={rr}  score={score}  [{_html_escape(outcome)}]{pnl_str}"
+                f"<code>{_html_escape(t_str)}</code> {tag} {_html_escape(dir_)} "
+                f"{_html_escape(srcs)}{dup_str}\n"
+                f"  E={_num(entry)} SL={_num(sl)} TP={_num(tp)}  "
+                f"RR={_num(rr)}  score={score:.1f}  [{_html_escape(outcome)}]{pnl_str}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -308,6 +363,30 @@ class TelegramNotifier:
                 parts.append(f"DB 查询异常: {_html_escape(str(e))}")
         await update.message.reply_text("\n".join(parts), parse_mode="HTML")
 
+    async def _cmd_close(self, update: Any, context: Any) -> None:
+        """手动关闭一个 tracker(用户没进场或已平仓时用)。"""
+        if not self._is_authorized(update):
+            return
+        if self._tracker is None:
+            await update.message.reply_text("tracker 未接入")
+            return
+        if not context.args:
+            await update.message.reply_text("用法: /close <sid 前 8 位>")
+            return
+        sid_prefix = context.args[0].strip()
+        try:
+            closed = await self._tracker.close_manual(sid_prefix)
+        except Exception as e:  # noqa: BLE001
+            await update.message.reply_text(f"关闭失败: {e}")
+            return
+        if closed is None:
+            await update.message.reply_text(f"未找到 open tracker: {sid_prefix}")
+        else:
+            await update.message.reply_text(
+                f"✅ tracker 已关闭: {closed.signal_id[:8]} "
+                f"({closed.direction} entry={closed.entry:.2f})"
+            )
+
     async def _cmd_help(self, update: Any, context: Any) -> None:
         if not self._is_authorized(update):
             return
@@ -315,9 +394,10 @@ class TelegramNotifier:
         await update.message.reply_text(
             "<b>SMC Bot 命令</b>\n\n"
             "👇 <b>点下方按钮</b>(推荐) 或输入 /命令\n\n"
-            "<code>/signals [小时]</code>  查近 N 小时 notified(默认 6,最多 168)\n"
-            "<code>/active</code>          列当前 in-flight 信号\n"
+            "<code>/signals [小时]</code>  查近 N 小时(默认 6,最多 168)\n"
+            "<code>/active</code>          当前 in-flight 信号\n"
             "<code>/status</code>          Bot 状态 + 最近 K 线时间\n"
+            "<code>/close &lt;sid&gt;</code>   手动关闭一个 tracker(不再监控 TP/SL)\n"
             "<code>/help</code>            显示帮助",
             parse_mode="HTML",
             reply_markup=kb,
