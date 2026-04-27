@@ -95,11 +95,17 @@ def score(signal_state, context: Dict[str, Any]) -> Tuple[float, Dict[str, float
         if mean_v > 0 and _v(last) > mean_v * 2:
             breakdown["C_Vol"] = 1.0
 
-    # --- C_Delta:订单流与方向同向(0-1)---
-    bar_delta = float(context.get("bar_delta", 0.0) or 0.0)
-    v_last = _v(last)
-    if v_last > 0:
-        ratio = bar_delta / v_last
+    # --- C_Delta:1h Step3 sweep K 的订单流方向(0-1)---
+    # 2026-04-26 改:从"15m 当前 K delta"切换到"1h Step3 sweep K delta"
+    # 原 15m delta 在 Step6 时刻取,和"Step5 破位 K"高度相关,信息量重复
+    # 1h sweep K delta 反映的是"价格进入 POI 时多/空头的真实净订单流"
+    # 同向逻辑(long → 买强 = 买盘吸收卖压 / short → 卖强 = 卖盘吸收买压)= POI 真拒绝
+    # 反向逻辑(long → 卖强 / short → 买强)= 趋势顺势,有冲突不加分
+    # 缺失 sweep_bar_delta 或 volume 时(早期信号或非 zone POI 路径)→ 0 分
+    sweep_delta = getattr(signal_state, "sweep_bar_delta", None)
+    sweep_vol = getattr(signal_state, "sweep_bar_volume", None)
+    if sweep_delta is not None and sweep_vol and sweep_vol > 0:
+        ratio = float(sweep_delta) / float(sweep_vol)
         if direction == "long" and ratio > 0.3:
             breakdown["C_Delta"] = 1.0
         elif direction == "short" and ratio < -0.3:

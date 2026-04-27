@@ -57,7 +57,8 @@ class SignalState:
     step1_trigger_price: Optional[float] = None      # Step1 创建时的 4h 收盘价,用于漂移失效检查
     step1_override_by_sweep: bool = False            # Step1 是否通过 1h 冲突 + deep sweep override 放行(用于 C10 评分)
     liquidity_sweep_candle: Optional[dict] = None
-    sweep_bar_delta: Optional[float] = None          # Step3 2h bar delta(证据)
+    sweep_bar_delta: Optional[float] = None          # Step3 1h sweep K delta(证据 + C_Delta 评分用)
+    sweep_bar_volume: Optional[float] = None         # Step3 1h sweep K volume(算 delta/vol ratio 用)
     sweep_wick_strong: Optional[bool] = None         # Step3 长影 >= 实体 × sweep_wick_ratio
     poi_type: Optional[str] = None
     poi_source: Optional[str] = None                 # "4h_ob" / "1h_ob" / "sweep_based"
@@ -832,6 +833,13 @@ class SignalEngine:
                     "time": _t(candle),
                 }
                 s.sweep_bar_delta = bar_d
+                # 同步保存 sweep K volume(供 scorer 算 delta/vol ratio)
+                try:
+                    s.sweep_bar_volume = float(
+                        candle["volume"] if isinstance(candle, dict) else candle.volume
+                    )
+                except (AttributeError, KeyError, TypeError):
+                    s.sweep_bar_volume = None
                 # sweep-based POI 的区间本身就是"扫荡 K 线"的证据,视为 wick_strong=True
                 # 让 C9(扫荡双过)在 delta 同向时自动命中,消除 sweep POI 的评分劣势
                 s.sweep_wick_strong = True if s.poi_source == "sweep_based" else wick_strong

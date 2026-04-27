@@ -183,7 +183,7 @@ def simulate_outcome_hybrid(
                 # trail_stop 仍在 entry 下方时,兜底让 SL 继续起作用
         else:
             if hi >= sl:
-                realized_r += remaining * (entry - sl) / risk * -1  # = -remaining
+                realized_r += remaining * (entry - sl) / risk  # = -remaining(short: entry<sl)
                 return {"outcome": "sl", "pnl_r": round(realized_r, 3),
                         "bars": bars_after, "tp1_hit": tp1_hit}
             if not tp1_hit and lo <= tp:
@@ -659,6 +659,9 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
             else:
                 row["win"] = None
             row["notified"] = int(bool(r.get("notified")))
+            row["hybrid_outcome"] = r.get("hybrid_outcome")
+            row["hybrid_pnl_r"] = r.get("hybrid_pnl_r")
+            row["hybrid_tp1_hit"] = int(bool(r.get("hybrid_tp1_hit"))) if r.get("hybrid_outcome") else None
             rows.append(row)
         if rows:
             # 固定列顺序,便于后续分析
@@ -672,6 +675,7 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
                 "score_total",
                 "C1", "C2", "C3", "C4", "C5", "C6", "C7", "C8", "C9",
                 "notified", "outcome", "pnl_r", "win",
+                "hybrid_outcome", "hybrid_pnl_r", "hybrid_tp1_hit",
             ]
             # 补齐缺失列
             for r in rows:
