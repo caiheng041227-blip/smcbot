@@ -62,9 +62,19 @@ class CandleManager:
                     logger.exception("candle close callback failed")
         return candle
 
-    def last(self, symbol: str, timeframe: str) -> Optional[Candle]:
+    def last(self, symbol: str, timeframe: str, closed_only: bool = False) -> Optional[Candle]:
+        """返回最近 K 线。closed_only=True 时跳过未闭合的活 bar(每个 tf 的活 bar
+        close 字段都是当前市价,不能用来反映该 tf 的实际收盘 — /status 用)。
+        """
         dq = self._store.get((symbol, timeframe))
-        return dq[-1] if dq else None
+        if not dq:
+            return None
+        if not closed_only:
+            return dq[-1]
+        for c in reversed(dq):
+            if c.closed:
+                return c
+        return None
 
     def window(self, symbol: str, timeframe: str, n: int) -> List[Candle]:
         dq = self._store.get((symbol, timeframe))

@@ -336,7 +336,11 @@ class TelegramNotifier:
             if candles is not None:
                 for tf in ("15m", "1h", "4h"):
                     try:
-                        last = candles.last(getattr(self._engine, "symbol", "ETHUSDT") or "ETHUSDT", tf)
+                        last = candles.last(
+                            getattr(self._engine, "symbol", "ETHUSDT") or "ETHUSDT",
+                            tf,
+                            closed_only=True,
+                        )
                         if last is not None:
                             parts.append(f"最近 {tf} close: {self._fmt_ts(last.close_time // 1000)}  C={last.close}")
                     except Exception:  # noqa: BLE001
