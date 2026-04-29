@@ -1489,6 +1489,8 @@ class SignalEngine:
                 vp = self._vp_provider() if self._vp_provider else None
                 ctx = {
                     "candles": candles_15m,
+                    "candles_4h": h4,
+                    "atr_4h": self._atr(symbol, "4h"),
                     "levels": levels,
                     "bar_delta": self._bar_delta.get("15m", 0.0),
                     "vp": vp,

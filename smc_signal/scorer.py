@@ -74,7 +74,7 @@ def score(signal_state, context: Dict[str, Any]) -> Tuple[float, Dict[str, float
       - levels / vp / h4_structure / level_proximity_pct(新版不使用,为保向后兼容)
     """
     breakdown: Dict[str, float] = {
-        k: 0.0 for k in ("C_POI", "C_Vol", "C_Delta", "C_Override", "C_Confluence")
+        k: 0.0 for k in ("C_POI", "C_Vol", "C_Delta", "C_Override", "C_Confluence", "C_Fib")
     }
     candles: Sequence[Any] = context.get("candles") or []
     if not candles:
@@ -124,6 +124,40 @@ def score(signal_state, context: Dict[str, Any]) -> Tuple[float, Dict[str, float
         nearest = min(abs(price - lv) / price for lv in level_values)
         if nearest <= prox:
             breakdown["C_Confluence"] = 1.0
+
+    # --- C_Fib:入场价落在最近 4h swing 的 OTE 区间(0.62~0.79 回撤)---
+    # 2026-04-29 实验:Fib OTE confluence 维度
+    # 用 ATR pivot 取最近一对 4h swing(high+low),算 0.62~0.79 区间
+    # long → 入场价在 (low + 0.21*range, low + 0.38*range) → C_Fib = 1
+    # short → 入场价在 (high - 0.38*range, high - 0.21*range) → C_Fib = 1
+    # range = high - low,Fib 0.62 = 起点 + 0.62*range,0.79 = 起点 + 0.79*range
+    candles_4h = context.get("candles_4h") or []
+    atr_4h = float(context.get("atr_4h") or 0.0)
+    if len(candles_4h) >= 13 and atr_4h > 0:
+        try:
+            from engine.market_structure import find_swing_points_atr
+            highs, lows = find_swing_points_atr(candles_4h, atr_4h, min_move_mult=1.0)
+            if highs and lows:
+                last_high = highs[-1]["price"]
+                last_low = lows[-1]["price"]
+                # 仅当 swing pair 形成"摆动段"(low<high)才算
+                if last_high > last_low:
+                    rng = last_high - last_low
+                    if direction == "long":
+                        # 多头从 low 开始算回撤;OTE = 0.62~0.79 回撤(对 long 是从 low 反弹接近 high 的中段)
+                        # 实际入场常在回撤后的 0.62~0.79 区间(从 high 算下来 38%~21%)
+                        ote_low = last_high - 0.79 * rng
+                        ote_high = last_high - 0.62 * rng
+                        if ote_low <= price <= ote_high:
+                            breakdown["C_Fib"] = 1.0
+                    elif direction == "short":
+                        # 空头对称:从 high 算回撤,OTE 是 0.62~0.79
+                        ote_low = last_low + 0.62 * rng
+                        ote_high = last_low + 0.79 * rng
+                        if ote_low <= price <= ote_high:
+                            breakdown["C_Fib"] = 1.0
+        except Exception:  # noqa: BLE001
+            pass
 
     total = sum(breakdown.values())
     return total, breakdown
