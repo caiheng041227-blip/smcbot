@@ -143,13 +143,17 @@ class TelegramNotifier:
             self._app = None
 
     async def send_signal(self, signal: Any, with_actions: bool = False) -> bool:
-        """发送信号消息。`with_actions` 参数保留为兼容性占位,当前不生成按钮。"""
+        """发送信号消息。`with_actions` 参数保留为兼容性占位,当前不生成按钮。
+
+        2026-05-02: 用 plain text(parse_mode=None),避免 POI 源名/triggered_level
+        里的下划线触发 Markdown 解析失败导致整条消息被服务器拒收。
+        """
         try:
             text = format_signal(signal)
         except Exception as e:  # noqa: BLE001
             logger.error(f"格式化信号失败: {e}")
             return False
-        return await self.send_text(text)
+        return await self.send_text(text, parse_mode=None)
 
     async def send_text(
         self,
