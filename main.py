@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -298,6 +299,111 @@ async def main_async() -> None:
 
     candles.subscribe_close(on_candle_close)
 
+    async def heartbeat_loop():
+        """定时上报 bot 健康状态。
+        每 N 小时一次,推一条 TG 消息:过去 N 小时统计 + 当前 4 TF 结构 + 阻塞原因。
+        即使 0 信号也能让用户知道 bot 活着 + 看见了什么市况。
+        """
+        from engine.market_structure import classify_structure, classify_structure_atr
+        from datetime import datetime, timezone
+        import pytz as _pytz
+        ny = _pytz.timezone(tz_name)
+        hours = float(cfg.get("heartbeat_hours", 6))
+        if hours <= 0:
+            return  # 关闭心跳
+        await asyncio.sleep(60)  # 启动后等 1 分钟再开始(等 replay 完成 + 数据充足)
+        while True:
+            try:
+                # ---- 收集 6h 内信号统计 ----
+                cutoff = int(time.time()) - int(hours * 3600)
+                if db is not None:
+                    rows = await db.recent_signals(hours=int(hours), limit=200, include_scored=True)
+                else:
+                    rows = []
+                # 按 (dir, entry, sl, tp) 折叠成"机会数"
+                groups = set()
+                n_notified = 0
+                for r in rows:
+                    key = (r.get("direction"), round(float(r.get("entry_price") or 0), 2),
+                           round(float(r.get("stop_loss") or 0), 2),
+                           round(float(r.get("take_profit") or 0), 2))
+                    groups.add(key)
+                    if r.get("notified_at"):
+                        n_notified += 1
+                n_opportunities = len(groups)
+
+                # ---- in-flight 信号 ----
+                from smc_signal.state_machine import SignalStep as _SS
+                active = engine.active_signals or {}
+                in_flight = sum(
+                    1 for s in active.values()
+                    if s.step not in (_SS.NOTIFIED, _SS.EXPIRED, _SS.INVALIDATED, _SS.SCORED)
+                )
+
+                # ---- 当前 4 TF 结构 ----
+                struct = {}
+                close_prices = {}
+                for tf in ("15m", "1h", "4h", "1d"):
+                    win = candles.window(symbol, tf, 50)
+                    if len(win) >= 13:
+                        if tf in ("1h", "4h", "1d"):
+                            atr_v = engine._atr(symbol, tf)
+                            struct[tf] = (
+                                classify_structure_atr(win, atr_v, 1.0)
+                                if atr_v > 0 else classify_structure(win, 5)
+                            )
+                        else:
+                            struct[tf] = classify_structure(win, 3)
+                    else:
+                        struct[tf] = "?"
+                    last = candles.last(symbol, tf, closed_only=True)
+                    if last:
+                        close_prices[tf] = last.close
+
+                # ---- 推断阻塞原因 ----
+                blocker = ""
+                m15 = struct.get("15m", "?")
+                if m15 in ("bullish", "bearish"):
+                    for tf_name in ("D1", "4h", "1h"):
+                        tf_key = "1d" if tf_name == "D1" else tf_name
+                        st = struct.get(tf_key, "neutral")
+                        if st in ("bullish", "bearish") and st != m15:
+                            dir_cn = "long" if m15 == "bullish" else "short"
+                            blocker = f"{tf_name}={st} 阻塞 {dir_cn}"
+                            break
+                elif m15 == "neutral":
+                    blocker = "15m 结构 neutral,Step1 主驱动失活"
+
+                # ---- 组装消息 ----
+                now_et = datetime.now(timezone.utc).astimezone(ny).strftime("%m-%d %H:%M ET")
+                emoji_map = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪", "?": "❓"}
+                lines = [
+                    f"🫀 SMC Bot 心跳 [{now_et}]",
+                    f"━━━━━━━━━━━━━━━",
+                    f"📊 过去 {int(hours)}h:",
+                    f"  • 交易机会: {n_opportunities}(去重后)",
+                    f"  • NOTIFIED: {n_notified}",
+                    f"  • in-flight: {in_flight}",
+                    "",
+                    f"🔍 4 TF 结构:",
+                ]
+                for tf, st in struct.items():
+                    px = close_prices.get(tf)
+                    px_str = f"  C={px:.2f}" if px else ""
+                    lines.append(f"  {emoji_map.get(st, '?')} {tf:<4} {st}{px_str}")
+                if blocker:
+                    lines.extend(["", f"🚧 {blocker}"])
+                else:
+                    lines.extend(["", "✓ 各 TF 对齐,等待 setup 形成"])
+
+                if notifier:
+                    await notifier.send_text("\n".join(lines), parse_mode=None)
+                else:
+                    logger.info("[heartbeat] " + " | ".join(lines[2:]))
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"heartbeat 异常: {e}")
+            await asyncio.sleep(hours * 3600)
+
     async def notify_loop():
         from smc_signal.state_machine import SignalStep as _SS
         while True:
@@ -426,6 +532,7 @@ async def main_async() -> None:
         asyncio.create_task(ws.run()),
         asyncio.create_task(periodic_vp_print(vp_session, levels, 60.0)),
         asyncio.create_task(notify_loop()),
+        asyncio.create_task(heartbeat_loop()),
     ]
     try:
         await stop_event.wait()

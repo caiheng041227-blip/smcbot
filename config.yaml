@@ -37,6 +37,10 @@ storage:
 # 24 = 回放近 24h(推荐:覆盖 Step1 36h TTL 的大部分场景)
 replay_hours: 24
 
+# 心跳通知:每 N 小时主动 TG 推一条 bot 状态(0 = 关闭)
+# 即使 0 NOTIFIED 也能让用户知道 bot 活着 + 看见的市况
+heartbeat_hours: 6
+
 logging:
   level: INFO
 
