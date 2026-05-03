@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -190,12 +192,104 @@ class SignalTracker:
         t.closed_at = now
         t.close_reason = reason
         await self._persist(t)
+        # Tier 1:回写 outcome / pnl_r 到 signals 表(供 /signals 查询和后续统计)
+        pnl_r = self._compute_pnl_r(t, price, reason)
+        if self.db is not None:
+            try:
+                await self.db.update_signal_outcome(t.signal_id, reason, pnl_r)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"回写 signals.outcome 失败 {t.signal_id[:8]}: {e}")
+        # 推送 + Tier 2 (SL 自动验尸)
         if reason == "tp2":
             await self._alert_tp2(t, price)
         elif reason == "sl":
             await self._alert_sl(t, price, after_tp1=False)
+            asyncio.create_task(self._auto_postmortem(t, "sl"))
         elif reason == "tp1_then_sl":
             await self._alert_sl(t, price, after_tp1=True)
+            asyncio.create_task(self._auto_postmortem(t, "tp1_then_sl"))
+
+    def _compute_pnl_r(self, t: Tracker, exit_price: float, reason: str) -> Optional[float]:
+        """以 entry→SL 距离为 1 R,算总 PnL。仓位单位化:tp1_portion + (1-tp1_portion)。"""
+        if t.entry == t.sl:
+            return None
+        risk = abs(t.entry - t.sl)
+        if reason == "sl":
+            return -1.0  # 全仓止损
+        if reason == "tp1_then_sl":
+            # tp1 落袋 + 剩余仓 SL
+            r_tp1 = (t.tp1 - t.entry) / risk if t.direction == "long" else (t.entry - t.tp1) / risk
+            return round(t.tp1_portion * r_tp1 - (1 - t.tp1_portion), 3)
+        if reason == "tp2":
+            # tp1 落袋 + 剩余仓追踪止盈出场
+            r_tp1 = (t.tp1 - t.entry) / risk if t.direction == "long" else (t.entry - t.tp1) / risk
+            r_trail = (exit_price - t.entry) / risk if t.direction == "long" else (t.entry - exit_price) / risk
+            return round(t.tp1_portion * r_tp1 + (1 - t.tp1_portion) * r_trail, 3)
+        # manual / unknown
+        return None
+
+    async def _auto_postmortem(self, t: Tracker, reason: str) -> None:
+        """Tier 2:SL 命中后,自动跑 Claude 验尸,推 TG 报告。
+
+        规则(由 CLAUDE.md 强制):Claude 只分析、提建议,不 commit / push / 部署,
+        必须等用户在 TG 回 "执行"才动手。
+        """
+        if self.notifier is None:
+            return
+        # 等 5 秒,让前面的 ⛔ SL 提醒先送达
+        await asyncio.sleep(5)
+        try:
+            await self.notifier.send_text(
+                f"🔬 自动验尸中 [{t.signal_id[:8]}] (≤5min,Claude 在 Lightsail 跑)...",
+                parse_mode=None,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        prompt = (
+            f"信号 {t.signal_id} 刚命中 SL,自动验尸分析:\n"
+            f"- 方向: {t.direction}\n"
+            f"- entry: {t.entry}, SL: {t.sl}, TP1: {t.tp1}\n"
+            f"- ATR_4h at entry: {t.atr_4h}\n"
+            f"- 出场原因: {reason}({'tp1 后剩余仓 SL' if reason=='tp1_then_sl' else '全仓 SL'})\n"
+            f"\n请你做以下分析:\n"
+            f"1. 查 data/market.db signals 表找这条信号的 SCORED breakdown / POI source / triggered_level\n"
+            f"2. 查 systemd journal 看持仓期间(从 created_at 到 closed_at)的 STEP 推进 / invalidate / 4h 翻转事件\n"
+            f"3. 查 signals 表近 5 次 outcome 含 'sl' 的信号,找共性(POI 源 / 方向 / score 区间 / 持仓时长)\n"
+            f"4. 输出 3 段(总长 < 1500 字):\n"
+            f"   ① 直接原因(2-3 句,具体到哪根 K 反向 / 哪个条件失效)\n"
+            f"   ② 与近 5 次 SL 的共性模式(列表)\n"
+            f"   ③ 改进建议(具体到改哪个文件哪一行,如果改 scorer/state_machine 跑 187d 回测验证 ΣR)\n"
+            f"5. ⚠️ 严格遵守 CLAUDE.md 规则:不要 commit / push / 部署,等用户在 TG 回 '执行' 才动手\n"
+        )
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "-p", prompt,
+                "--dangerously-skip-permissions",
+                cwd="/home/ubuntu/smcbot",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=8 * 1024 * 1024,
+                env={**os.environ},
+            )
+            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+            output = stdout.decode("utf-8", errors="ignore").strip() or "(验尸无输出)"
+            # TG 4096 限,留余量
+            if len(output) > 3600:
+                output = output[:3600] + "\n...(truncated)"
+            await self.notifier.send_text(
+                f"🧠 验尸报告 [{t.signal_id[:8]}]:\n\n{output}",
+                parse_mode=None,
+            )
+        except asyncio.TimeoutError:
+            await self.notifier.send_text(f"⏱️ 验尸超时 [{t.signal_id[:8]}],10 分钟没出结果")
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"_auto_postmortem 失败 {t.signal_id[:8]}: {e}")
+            try:
+                await self.notifier.send_text(f"❌ 验尸异常 [{t.signal_id[:8]}]: {e}")
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _persist(self, t: Tracker) -> None:
         if self.db is None:

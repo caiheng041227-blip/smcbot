@@ -294,6 +294,26 @@ class Database:
 
     # ---- signal_trackers ---------------------------------------------------
 
+    async def update_signal_outcome(
+        self, signal_id: str, outcome: str, pnl_r: Optional[float] = None
+    ) -> None:
+        """Tracker 关闭时同步回写 outcome / pnl_r 到 signals 表(供 /signals + 后续统计)。
+
+        outcome:
+          - 'sl' / 'tp1_then_sl' / 'tp2' / 'manual'(同 close_reason)
+        pnl_r:
+          - 全仓 SL → -1.0
+          - tp1 落袋后剩余 SL → tp1_portion * rr_tp1 - (1-tp1_portion)
+          - tp2 trail 平仓 → tp1_portion * rr_tp1 + (1-tp1_portion) * rr_trail
+        """
+        assert self._conn is not None
+        now = int(time.time())
+        await self._conn.execute(
+            "UPDATE signals SET outcome=?, pnl_r=?, outcome_at=? WHERE signal_id=?",
+            (outcome, pnl_r, now, signal_id),
+        )
+        await self._conn.commit()
+
     async def upsert_tracker(self, t: Any) -> None:
         """写入/更新 signal_trackers 行。t 是 Tracker dataclass,按字段名读取。"""
         assert self._conn is not None
