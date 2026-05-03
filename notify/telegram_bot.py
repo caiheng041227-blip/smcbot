@@ -395,7 +395,9 @@ class TelegramNotifier:
             )
             return
         prompt = " ".join(context.args)
-        await update.message.reply_text(f"🤔 Claude 正在处理 (≤15min)...\n\n{prompt}")
+        start_msg = await update.message.reply_text(
+            f"🤔 Claude 正在处理 (≤15min)...\n\n{prompt}\n\n(每 60 秒一次进度)"
+        )
         try:
             proc = await asyncio.create_subprocess_exec(
                 "claude", "-p", prompt,
@@ -406,13 +408,30 @@ class TelegramNotifier:
                 limit=8 * 1024 * 1024,
                 env={**os.environ},
             )
+            # 边等边推心跳:每 60 秒回报一次"还活着,已经 N 分钟"
+            comm_task = asyncio.create_task(proc.communicate())
+            elapsed = 0
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=900
-                )
-            except asyncio.TimeoutError:
+                while not comm_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(comm_task), timeout=60)
+                        break
+                    except asyncio.TimeoutError:
+                        elapsed += 60
+                        if elapsed >= 900:  # 15min 硬上限
+                            proc.kill()
+                            await update.message.reply_text("⏱️ Claude 超时 15min,已取消")
+                            return
+                        try:
+                            await update.message.reply_text(
+                                f"⏳ 还在思考... 已 {elapsed//60} 分钟,继续等"
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                stdout, stderr = comm_task.result()
+            except Exception as e:  # noqa: BLE001
                 proc.kill()
-                await update.message.reply_text("⏱️ Claude 思考超过 15 分钟,已取消")
+                await update.message.reply_text(f"❌ /ask 异常: {e}")
                 return
             output = stdout.decode("utf-8", errors="ignore").strip()
             if not output:
