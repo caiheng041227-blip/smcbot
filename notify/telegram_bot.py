@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
@@ -110,6 +112,7 @@ class TelegramNotifier:
             self._app.add_handler(CommandHandler("active", self._cmd_active))
             self._app.add_handler(CommandHandler("status", self._cmd_status))
             self._app.add_handler(CommandHandler("close", self._cmd_close))
+            self._app.add_handler(CommandHandler("ask", self._cmd_ask))
             self._app.add_handler(CommandHandler("help", self._cmd_help))
             self._app.add_handler(CommandHandler("start", self._cmd_help))
             # 文本按钮(ReplyKeyboard 点击后发来的是纯文本)
@@ -371,6 +374,67 @@ class TelegramNotifier:
                 parts.append(f"DB 查询异常: {_html_escape(str(e))}")
         await update.message.reply_text("\n".join(parts), parse_mode="HTML")
 
+    async def _cmd_ask(self, update: Any, context: Any) -> None:
+        """通过 TG 调用本机 Claude Code:让 Claude 查 / 改 / 部署 bot。
+
+        - subprocess 跑 `claude -p <prompt>` 在 ~/smcbot 目录(自动加载 CLAUDE.md)
+        - 用 OAuth token (Max subscription),不动 API balance
+        - --dangerously-skip-permissions 让非交互模式不卡 permission 弹窗
+        - 超长输出按 3800 字符分块发(TG 单条 4096 字符限)
+        - 超时 15 分钟(够回测 + 部署)
+        """
+        if not self._is_authorized(update):
+            return
+        if not context.args:
+            await update.message.reply_text(
+                "用法: /ask <问题>\n\n"
+                "示例:\n"
+                "  /ask 看下最近 6h 没信号是为什么\n"
+                "  /ask 把 4h_fvg 权重降到 0,跑 187d 回测看 ΣR\n"
+                "  /ask 修一下 telegram 推送的 markdown bug 并部署"
+            )
+            return
+        prompt = " ".join(context.args)
+        await update.message.reply_text(f"🤔 Claude 正在处理 (≤15min)...\n\n{prompt}")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "claude", "-p", prompt,
+                "--dangerously-skip-permissions",
+                cwd="/home/ubuntu/smcbot",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=8 * 1024 * 1024,
+                env={**os.environ},
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=900
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await update.message.reply_text("⏱️ Claude 思考超过 15 分钟,已取消")
+                return
+            output = stdout.decode("utf-8", errors="ignore").strip()
+            if not output:
+                err_str = stderr.decode("utf-8", errors="ignore")[:600]
+                await update.message.reply_text(
+                    f"⚠️ Claude 没输出。\n\nstderr:\n{err_str}"
+                )
+                return
+            # 分块发送
+            max_chunk = 3800
+            if len(output) <= max_chunk:
+                await update.message.reply_text(f"💡 Claude:\n\n{output}", parse_mode=None)
+            else:
+                chunks = [output[i:i + max_chunk] for i in range(0, len(output), max_chunk)]
+                for i, chunk in enumerate(chunks, 1):
+                    await update.message.reply_text(
+                        f"💡 Claude ({i}/{len(chunks)}):\n\n{chunk}",
+                        parse_mode=None,
+                    )
+        except Exception as e:  # noqa: BLE001
+            await update.message.reply_text(f"❌ /ask 调用失败: {e}")
+
     async def _cmd_close(self, update: Any, context: Any) -> None:
         """手动关闭一个 tracker(用户没进场或已平仓时用)。"""
         if not self._is_authorized(update):
@@ -406,6 +470,7 @@ class TelegramNotifier:
             "<code>/active</code>          当前 in-flight 信号\n"
             "<code>/status</code>          Bot 状态 + 最近 K 线时间\n"
             "<code>/close &lt;sid&gt;</code>   手动关闭一个 tracker(不再监控 TP/SL)\n"
+            "<code>/ask &lt;问题&gt;</code>   问 Claude 任何问题(查/改/部署 bot)\n"
             "<code>/help</code>            显示帮助",
             parse_mode="HTML",
             reply_markup=kb,
