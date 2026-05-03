@@ -38,6 +38,10 @@ class Tracker:
     peak: Optional[float] = None              # high since TP1 (long) / low since TP1 (short)
     closed_at: Optional[int] = None
     close_reason: Optional[str] = None        # 'sl' | 'tp2' | 'tp1_then_sl' | 'manual'
+    poi_source: Optional[str] = None          # 用于 SL 后判断是否走 IFVG(只对 4h_fvg)
+    poi_low: Optional[float] = None
+    poi_high: Optional[float] = None
+    tp_target: Optional[float] = None         # 原始 TP,IFVG 二次入场复用
 
 
 class SignalTracker:
@@ -104,6 +108,10 @@ class SignalTracker:
             trail_mult=self.default_trail_mult,
             tp1_portion=self.default_tp1_portion,
             created_at=int(time.time()),
+            poi_source=getattr(s, "poi_source", None),
+            poi_low=getattr(s, "poi_low", None),
+            poi_high=getattr(s, "poi_high", None),
+            tp_target=float(tp),
         )
         self.trackers[t.signal_id] = t
         await self._persist(t)
@@ -199,6 +207,23 @@ class SignalTracker:
                 await self.db.update_signal_outcome(t.signal_id, reason, pnl_r)
             except Exception as e:  # noqa: BLE001
                 logger.error(f"回写 signals.outcome 失败 {t.signal_id[:8]}: {e}")
+        # IFVG 注册:SL'd 4h_fvg 信号 → 写 failed_pois,等价格回踩做二次入场
+        if reason in ("sl", "tp1_then_sl") and t.poi_source == "4h_fvg" and self.db is not None:
+            if t.poi_low is not None and t.poi_high is not None and t.tp_target is not None:
+                try:
+                    await self.db.register_failed_poi(
+                        original_signal_id=t.signal_id,
+                        symbol=t.symbol,
+                        direction=t.direction,
+                        poi_source=t.poi_source,
+                        poi_low=t.poi_low,
+                        poi_high=t.poi_high,
+                        tp_target=t.tp_target,
+                        ttl_hours=24,
+                    )
+                    logger.info(f"[IFVG] {t.signal_id[:8]} 4h_fvg SL → 注册等待 24h 回踩二次入场")
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"register_failed_poi 失败: {e}")
         # 推送 + Tier 2 (SL 自动验尸)
         if reason == "tp2":
             await self._alert_tp2(t, price)

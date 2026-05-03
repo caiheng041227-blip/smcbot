@@ -96,6 +96,25 @@ SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_trackers_closed ON signal_trackers(closed_at)",
+    """
+    CREATE TABLE IF NOT EXISTS failed_pois (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        original_signal_id TEXT NOT NULL,
+        symbol           TEXT NOT NULL,
+        direction        TEXT NOT NULL,
+        poi_source       TEXT NOT NULL,
+        poi_low          REAL NOT NULL,
+        poi_high         REAL NOT NULL,
+        sl_hit_at        INTEGER NOT NULL,
+        sl_hit_extreme   REAL,                 -- short: max high after SL / long: min low after SL
+        tp_target        REAL NOT NULL,
+        status           TEXT NOT NULL DEFAULT 'awaiting',  -- 'awaiting' / 'reentered' / 'expired'
+        expires_at       INTEGER NOT NULL,
+        reentered_at     INTEGER,
+        new_signal_id    TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_failed_pois_status ON failed_pois(status, symbol)",
 ]
 
 
@@ -293,6 +312,81 @@ class Database:
             return [dict(zip(cols, row)) for row in await cur.fetchall()]
 
     # ---- signal_trackers ---------------------------------------------------
+
+    # ---- failed_pois (IFVG 二次入场) ----------------------------------
+
+    async def register_failed_poi(
+        self,
+        original_signal_id: str,
+        symbol: str,
+        direction: str,
+        poi_source: str,
+        poi_low: float,
+        poi_high: float,
+        tp_target: float,
+        ttl_hours: int = 24,
+    ) -> int:
+        """SL'd 4h_fvg 信号注册到 failed_pois,等待价格回踩做 IFVG。"""
+        assert self._conn is not None
+        now = int(time.time())
+        expires = now + ttl_hours * 3600
+        async with self._conn.execute(
+            """
+            INSERT INTO failed_pois (
+                original_signal_id, symbol, direction, poi_source,
+                poi_low, poi_high, sl_hit_at, sl_hit_extreme, tp_target,
+                status, expires_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                original_signal_id, symbol, direction, poi_source,
+                poi_low, poi_high, now, None, tp_target,
+                "awaiting", expires,
+            ),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._conn.commit()
+        return row_id
+
+    async def get_active_failed_pois(self, symbol: str) -> List[Dict[str, Any]]:
+        """查 awaiting + 未过期的 failed_pois,供 IFVG re-entry 检查。"""
+        assert self._conn is not None
+        now = int(time.time())
+        async with self._conn.execute(
+            "SELECT * FROM failed_pois WHERE status='awaiting' AND symbol=? AND expires_at > ?",
+            (symbol, now),
+        ) as cur:
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, row)) for row in await cur.fetchall()]
+
+    async def update_failed_poi_extreme(self, row_id: int, extreme: float) -> None:
+        """更新失败 POI 的反向极值(short 用 max high,long 用 min low)。"""
+        assert self._conn is not None
+        await self._conn.execute(
+            "UPDATE failed_pois SET sl_hit_extreme=? WHERE id=?",
+            (extreme, row_id),
+        )
+        await self._conn.commit()
+
+    async def mark_failed_poi_reentered(self, row_id: int, new_signal_id: str) -> None:
+        assert self._conn is not None
+        await self._conn.execute(
+            "UPDATE failed_pois SET status='reentered', reentered_at=?, new_signal_id=? WHERE id=?",
+            (int(time.time()), new_signal_id, row_id),
+        )
+        await self._conn.commit()
+
+    async def expire_failed_pois(self) -> int:
+        """惰性清理:把超时的 awaiting 改成 expired。返回清理数量。"""
+        assert self._conn is not None
+        now = int(time.time())
+        async with self._conn.execute(
+            "UPDATE failed_pois SET status='expired' WHERE status='awaiting' AND expires_at <= ?",
+            (now,),
+        ) as cur:
+            n = cur.rowcount
+        await self._conn.commit()
+        return n
 
     async def update_signal_outcome(
         self, signal_id: str, outcome: str, pnl_r: Optional[float] = None

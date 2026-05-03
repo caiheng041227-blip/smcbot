@@ -1327,6 +1327,121 @@ class SignalEngine:
                 return True
         return False
 
+    async def check_ifvg_reentry(self, symbol: str, candle: Any, db: Any) -> List[str]:
+        """IFVG 二次入场:在 1h 收盘检查 failed_pois 是否被价格回踩。
+
+        逻辑(只对 4h_fvg):
+          1. 用 candle.high / low 更新所有 awaiting failed_pois 的反向极值
+          2. 若 1h K 的 wick 重新进入 POI 区间(short: low <= poi_high;long: high >= poi_low)
+             → 创建新 SignalState(step=SCORED, source='4h_fvg_ifvg')
+             → 标记 failed_poi 为 reentered
+          3. 惰性清理过期 failed_pois
+
+        返回:新创建的 signal_id 列表(供 main.py 接 tracker)
+        """
+        new_sids: List[str] = []
+        if db is None or candle is None:
+            return new_sids
+        try:
+            await db.expire_failed_pois()
+            failed = await db.get_active_failed_pois(symbol)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"check_ifvg_reentry: db 查询失败 {e}")
+            return new_sids
+        if not failed:
+            return new_sids
+
+        hi = float(candle["high"] if isinstance(candle, dict) else candle.high)
+        lo = float(candle["low"] if isinstance(candle, dict) else candle.low)
+        close = float(candle["close"] if isinstance(candle, dict) else candle.close)
+
+        for fp in failed:
+            try:
+                direction = fp["direction"]
+                poi_low = float(fp["poi_low"])
+                poi_high = float(fp["poi_high"])
+                tp_target = float(fp["tp_target"])
+                cur_extreme = fp.get("sl_hit_extreme")
+
+                # 更新极值
+                if direction == "short":
+                    new_ext = hi if cur_extreme is None else max(float(cur_extreme), hi)
+                    if cur_extreme is None or new_ext > float(cur_extreme):
+                        await db.update_failed_poi_extreme(fp["id"], new_ext)
+                    cur_extreme = new_ext
+                else:
+                    new_ext = lo if cur_extreme is None else min(float(cur_extreme), lo)
+                    if cur_extreme is None or new_ext < float(cur_extreme):
+                        await db.update_failed_poi_extreme(fp["id"], new_ext)
+                    cur_extreme = new_ext
+
+                # 回踩判定
+                reentered = False
+                if direction == "short" and lo <= poi_high:
+                    reentered = True
+                elif direction == "long" and hi >= poi_low:
+                    reentered = True
+                if not reentered:
+                    continue
+
+                # 计算 IFVG entry/SL/TP
+                entry = close
+                poi_height = poi_high - poi_low
+                sl_buf = poi_height * 0.5  # 同回测参数
+                if direction == "short":
+                    new_sl = float(cur_extreme) + sl_buf
+                    if entry >= new_sl or entry <= tp_target:
+                        # entry 已穿过 SL 或已穿过 TP → 不入场
+                        continue
+                    risk = new_sl - entry
+                    reward = entry - tp_target
+                else:
+                    new_sl = float(cur_extreme) - sl_buf
+                    if entry <= new_sl or entry >= tp_target:
+                        continue
+                    risk = entry - new_sl
+                    reward = tp_target - entry
+                if risk <= 0:
+                    continue
+                rr = reward / risk
+
+                # 创建 SignalState(直接到 SCORED,跳过 Step1-5)
+                sid = str(uuid.uuid4())
+                now = self._now()
+                self.active_signals[sid] = SignalState(
+                    signal_id=sid,
+                    symbol=symbol,
+                    direction=direction,
+                    step=SignalStep.SCORED,
+                    poi_source="4h_fvg_ifvg",
+                    poi_type="bearish_fvg_ifvg" if direction == "short" else "bullish_fvg_ifvg",
+                    poi_low=poi_low,
+                    poi_high=poi_high,
+                    triggered_level="POI_high" if direction == "short" else "POI_low",
+                    triggered_level_value=poi_high if direction == "short" else poi_low,
+                    entry_price=entry,
+                    stop_loss=new_sl,
+                    take_profit=tp_target,
+                    risk_reward=rr,
+                    total_score=3.0,  # 4h_fvg_ifvg 给 Tier A 等价权重
+                    scores={"C_POI": 3.0, "C_Vol": 0.0, "C_Delta": 0.0,
+                            "C_Override": 0.0, "C_Confluence": 0.0, "C_Fib": 0.0},
+                    created_at=now,
+                    updated_at=now,
+                    expires_at=now + self.signal_ttl,
+                    notification_sent=False,
+                )
+                await db.mark_failed_poi_reentered(fp["id"], sid)
+                new_sids.append(sid)
+                logger.info(
+                    f"[IFVG] 创建二次入场信号 {sid[:8]} {direction} "
+                    f"entry={entry:.2f} SL={new_sl:.2f} TP={tp_target:.2f} RR={rr:.2f} "
+                    f"(原信号 {fp['original_signal_id'][:8]})"
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"check_ifvg_reentry 处理 failed_poi {fp.get('id')} 失败: {e}")
+        return new_sids
+
     def _advance_on_15m(self, symbol: str, candle: Any) -> None:
         """15m 收盘:Step5(CHoCH 确认) → Step6(入场 + SL) → 评分。
 

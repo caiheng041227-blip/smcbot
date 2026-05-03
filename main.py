@@ -267,6 +267,9 @@ async def main_async() -> None:
             # 仓位追踪:在 15m 收盘扫描所有 open tracker 的 TP1/SL/Trail 条件
             if tf == "15m":
                 asyncio.create_task(tracker.on_candle(sym, c))
+            # IFVG 二次入场:1h 收盘时扫 failed_pois 看是否回踩
+            if tf == "1h":
+                asyncio.create_task(engine.check_ifvg_reentry(sym, c, db))
 
     # REST 回填 + 状态回放:在订阅 close 回调之前灌入历史数据,并用近 N 小时
     # 的 K 线重放驱动 state_machine,恢复 active_signals(Step1/2/3/5 in-flight)。

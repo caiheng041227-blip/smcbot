@@ -45,6 +45,8 @@ _POI_TIER_WEIGHTS: Dict[str, float] = {
     "1h_breaker": 3.0,        # 187 天 41.8% WR / +27R(最佳)
     "failed_sweep_reentry": 3.0,   # 2026-04-23 升 1.0→3.0:187d 全量 49 笔 49% WR +51.49R,
                                    # 未通知赢家 +43.71R 占漏网总 R 的 88%,事实最强源
+    "4h_fvg_ifvg": 3.0,            # 2026-05-03 IFVG 二次入场:187d 5 笔 80% WR +21.27R,
+                                   # 由 state_machine.check_ifvg_reentry 自动产生
     # Tier B(+1)—— 平均或次优,需要至少 2 个其它证据才过阈值
     "4h_fvg": 1.0,            # 187 天 -10R 但删了暴露更烂,保留中位
     "4h_ob": 1.0,             # 小样本 80% WR(不可信但方向正)
