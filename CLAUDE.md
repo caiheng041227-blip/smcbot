@@ -1,5 +1,29 @@
 # SMC 交易信号 Bot — Claude Code 工作手册
 
+## ⚠️ 最重要的规则(适用所有改动)
+
+**任何代码改动都必须遵守:先汇报 → 等用户同意 → 再 commit + 部署。**
+
+具体流程:
+1. **先做本地修改**(只 `Edit` / `Write`,不动 git)
+2. **必要时跑验证**(回测、syntax check、跑测试等)
+3. **TG 报告**:具体改了什么文件、什么逻辑、回测对比数据(如果跑了)
+4. **等用户回复**类似"同意 / 好 / 部署吧"再继续
+5. **同意后**才 `git add` + `git commit` + `git push` + `ssh 部署`
+
+**禁止:**
+- ❌ 不汇报直接 commit
+- ❌ commit 之后才告诉用户(已 commit 的撤销成本更高)
+- ❌ 在用户没有明确"同意 / 部署 / push"等指令时擅自 push 到 GitHub
+- ❌ 在用户没有明确指令时擅自 ssh 进 Lightsail 重启 service
+
+**例外(可不报备直接做):**
+- ✅ 纯查询(读 DB、读 journal、读代码、跑回测看数据,不改任何文件)
+- ✅ 用户明确说"直接做"或"不用问我"时
+
+**用户改主意了想撤销:** 用户回复"撤销 / 不要这个改动",立刻 `git checkout <file>` 或 `git revert HEAD` 恢复。
+
+
 ## 项目速查
 
 - **品种**:ETHUSDT(OKX 数据)+ BTCUSDT(参考,correlation gate 已禁用)
