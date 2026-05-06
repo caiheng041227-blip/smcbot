@@ -344,19 +344,24 @@ async def main_async() -> None:
                 )
 
                 # ---- 当前 4 TF 结构 ----
+                # 2026-05-06:窗口数 + fallback lookback 对齐 Step1(state_machine._check_step1)
+                # 之前心跳全用 50 根 + lookback 5,Step1 用 (15m=100,1h=100,4h=50,1d=30) + lookback 3,
+                # ATR pivot 看到的 swing 范围不同 → 心跳显示与实际信号决策可能相反。
+                _HB_WIN = {"15m": 100, "1h": 100, "4h": 50, "1d": 30}
+                _HB_LB = 3  # = SignalEngine._STEP1_SWING_LOOKBACK
                 struct = {}
                 close_prices = {}
                 for tf in ("15m", "1h", "4h", "1d"):
-                    win = candles.window(symbol, tf, 50)
+                    win = candles.window(symbol, tf, _HB_WIN[tf])
                     if len(win) >= 13:
                         if tf in ("1h", "4h", "1d"):
                             atr_v = engine._atr(symbol, tf)
                             struct[tf] = (
                                 classify_structure_atr(win, atr_v, 1.0)
-                                if atr_v > 0 else classify_structure(win, 5)
+                                if atr_v > 0 else classify_structure(win, _HB_LB)
                             )
                         else:
-                            struct[tf] = classify_structure(win, 3)
+                            struct[tf] = classify_structure(win, _HB_LB)
                     else:
                         struct[tf] = "?"
                     last = candles.last(symbol, tf, closed_only=True)
