@@ -284,8 +284,14 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
     proxy = cfg.get("binance", {}).get("proxy") or os.getenv("HTTP_PROXY") or None
     logger.info(f"回测:{symbol} ref={ref_symbol} days={days}  proxy={proxy or '无'}")
 
-    # 拉历史 K 线(1d/4h/1h/15m)。OKX 两段拉取 (`/candles` + `/history-candles`)
-    # 已能翻到 ~1 年前,各 TF 按天数直接算即可。
+    # 拉历史 K 线(1d/4h/1h/15m)。Binance limit 上限 1500,>1500 走 OKX 两段拉取
+    # (`/market/candles` + `/market/history-candles`,可拉到 ~1 年前)。
+    from data.rest_backfill import _fetch_klines_okx
+    async def _fetch(sym, tf, lim):
+        if lim > 1500:
+            return await _fetch_klines_okx(sym, tf, lim, proxy, timeout_s=30)
+        return await fetch_klines(sym, tf, limit=lim, proxy=proxy)
+
     needs = {
         "1d": days + 30,
         "4h": days * 6 + 60,
@@ -294,12 +300,12 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
     }
     klines: Dict[str, List[dict]] = {}
     for tf, limit in needs.items():
-        klines[tf] = await fetch_klines(symbol, tf, limit=limit, proxy=proxy)
+        klines[tf] = await _fetch(symbol, tf, limit)
         logger.info(f"  拉取 {symbol} {tf}: {len(klines[tf])} 根")
 
     ref_klines: List[dict] = []
     if ref_symbol:
-        ref_klines = await fetch_klines(ref_symbol, "4h", limit=days * 6 + 60, proxy=proxy)
+        ref_klines = await _fetch(ref_symbol, "4h", days * 6 + 60)
         logger.info(f"  拉取 {ref_symbol} 4h: {len(ref_klines)} 根")
 
     # 构造 state_machine 栈
