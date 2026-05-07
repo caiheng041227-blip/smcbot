@@ -447,6 +447,8 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
                 "score": s.total_score,
                 "poi": s.poi_type,
                 "source": s.poi_source,
+                "poi_low": s.poi_low,
+                "poi_high": s.poi_high,
                 "notified": True,
                 "scores": dict(s.scores or {}),
                 "_content_key": ck,
@@ -471,6 +473,8 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
                     "score": s.total_score,
                     "poi": s.poi_type,
                     "source": s.poi_source,
+                    "poi_low": s.poi_low,
+                    "poi_high": s.poi_high,
                     "notified": False,
                     "scores": dict(s.scores or {}),
                     "_content_key": ck,
@@ -555,6 +559,86 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
             merged["hybrid_pnl_r"] = hy.get("pnl_r")
             merged["hybrid_tp1_hit"] = hy.get("tp1_hit")
         results.append(merged)
+
+    # === IFVG 二次入场模拟(对 NOTIFIED 4h_fvg + outcome=sl 的信号,反向触发)===
+    # 复用 scripts/ifvg_analysis.simulate_ifvg_reentry,逻辑同生产 state_machine.check_ifvg_reentry
+    from scripts.ifvg_analysis import simulate_ifvg_reentry
+    ny = pytz.timezone("America/New_York")
+    ifvg_added = 0
+    for r in list(results):
+        if r.get("source") != "4h_fvg" or not r.get("notified") or r.get("outcome") != "sl":
+            continue
+        poi_low = r.get("poi_low")
+        poi_high = r.get("poi_high")
+        if poi_low is None or poi_high is None:
+            continue
+        # SL 命中时刻 ≈ sig_time + bars × 1h(future_bars 里的 bar 是 1h)
+        bars_to_sl = r.get("bars") or 0
+        sl_hit_time_ms = int(r["time"]) + int(bars_to_sl) * 3600 * 1000
+        ifvg = simulate_ifvg_reentry(
+            sl_hit_time_ms=sl_hit_time_ms,
+            direction=r["direction"],
+            poi_low=float(poi_low),
+            poi_high=float(poi_high),
+            original_tp=r["tp"],
+            future_bars=future_1h,
+            max_hours=24,
+            sl_buffer_pct=0.5,
+        )
+        if not ifvg.get("reentered"):
+            continue
+        ifvg_features = dict(r.get("_features") or {})
+        ifvg_features.update({
+            "time_ms": ifvg["entry_time_ms"],
+            "time_iso": datetime.fromtimestamp(
+                ifvg["entry_time_ms"] / 1000.0, tz=timezone.utc
+            ).astimezone(ny).strftime("%Y-%m-%d %H:%M:%S"),
+            "direction": r["direction"],
+            "poi_source": "4h_fvg_ifvg",
+            "poi_type": "bearish_fvg_ifvg" if r["direction"] == "short" else "bullish_fvg_ifvg",
+            "entry": ifvg["entry"],
+            "sl": ifvg["sl"],
+            "tp": ifvg["tp"],
+            "rr": ifvg["rr"],
+            "score_total": 3.0,
+        })
+        ifvg_rec = {
+            "time": ifvg["entry_time_ms"],
+            "level": "POI_high" if r["direction"] == "short" else "POI_low",
+            "direction": r["direction"],
+            "entry": ifvg["entry"],
+            "sl": ifvg["sl"],
+            "tp": ifvg["tp"],
+            "rr": ifvg["rr"],
+            "score": 3.0,
+            "poi": "bearish_fvg_ifvg" if r["direction"] == "short" else "bullish_fvg_ifvg",
+            "source": "4h_fvg_ifvg",
+            "poi_low": poi_low,
+            "poi_high": poi_high,
+            "notified": True,
+            "scores": {"C_POI": 3.0},
+            "_features": ifvg_features,
+            "outcome": ifvg["outcome"],
+            "pnl_r": ifvg["pnl_r"],
+            "bars": ifvg.get("wait_bars"),
+        }
+        if trail_atr_mult > 0:
+            atr_4h_at_sig = float(ifvg_features.get("atr_4h") or 0.0)
+            future_after = [b for b in future_1h if int(b["t"]) > ifvg["entry_time_ms"]]
+            hy = simulate_outcome_hybrid(
+                ifvg["entry_time_ms"], r["direction"], ifvg["entry"], ifvg["sl"], ifvg["tp"],
+                atr_4h_at_sig, future_after, max_hours=168,
+                tp1_portion=tp1_portion, trail_atr_mult=trail_atr_mult,
+            )
+            ifvg_rec["hybrid_outcome"] = hy.get("outcome")
+            ifvg_rec["hybrid_pnl_r"] = hy.get("pnl_r")
+            ifvg_rec["hybrid_tp1_hit"] = hy.get("tp1_hit")
+        results.append(ifvg_rec)
+        ifvg_added += 1
+    if ifvg_added:
+        logger.info(f"[IFVG] 模拟 {ifvg_added} 条 4h_fvg_ifvg 二次入场信号")
+    else:
+        logger.info("[IFVG] 未触发任何 4h_fvg_ifvg 二次入场")
 
     # 打印表格
     print(f"\n{'='*100}")
