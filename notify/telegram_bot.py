@@ -36,7 +36,8 @@ except ImportError:  # 允许在无依赖环境下 import 模块
 
 
 # 按钮文字 → 对应命令映射(点击时 bot 收到的是文本)
-_BTN_6H = "📊 近 6h"
+# 2026-05-07:删 _BTN_6H,改用 _BTN_HEARTBEAT(SMC bot 心跳)
+_BTN_HEARTBEAT = "🫀 心跳"
 _BTN_24H = "📊 近 24h"
 _BTN_3D = "📊 近 3 天"
 _BTN_ACTIVE = "⏳ in-flight"
@@ -50,7 +51,7 @@ def _build_reply_keyboard() -> Any:
         return None
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton(_BTN_6H), KeyboardButton(_BTN_24H), KeyboardButton(_BTN_3D)],
+            [KeyboardButton(_BTN_HEARTBEAT), KeyboardButton(_BTN_24H), KeyboardButton(_BTN_3D)],
             [KeyboardButton(_BTN_ACTIVE), KeyboardButton(_BTN_STATUS), KeyboardButton(_BTN_HELP)],
         ],
         resize_keyboard=True,
@@ -495,15 +496,36 @@ class TelegramNotifier:
             reply_markup=kb,
         )
 
+    async def _cmd_heartbeat(self, update: Any, context: Any) -> None:
+        """SMC bot 心跳:推一条与定时心跳完全相同的状态消息。
+        依赖 main.py 在初始化时把 build_heartbeat_text 注入 self.heartbeat_text_builder。
+        """
+        if not self._is_authorized(update):
+            return
+        builder = getattr(self, "heartbeat_text_builder", None)
+        kb = _build_reply_keyboard()
+        if builder is None:
+            await update.message.reply_text(
+                "⚠️ 心跳功能未配置(notifier.heartbeat_text_builder 未注入)",
+                reply_markup=kb,
+            )
+            return
+        try:
+            text = await builder()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"_cmd_heartbeat 调用 builder 失败: {e}")
+            await update.message.reply_text(f"⚠️ 心跳生成失败:{e}", reply_markup=kb)
+            return
+        await update.message.reply_text(text, reply_markup=kb)
+
     async def _on_text(self, update: Any, context: Any) -> None:
         """处理按钮点击(ReplyKeyboard 发来的是纯文本)。"""
         if not self._is_authorized(update):
             return
         text = (update.message.text or "").strip()
         # 模拟 context.args 以复用命令 handler
-        if _BTN_6H in text:
-            context.args = ["6"]
-            await self._cmd_signals(update, context)
+        if _BTN_HEARTBEAT in text:
+            await self._cmd_heartbeat(update, context)
         elif _BTN_24H in text:
             context.args = ["24"]
             await self._cmd_signals(update, context)
