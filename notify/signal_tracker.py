@@ -253,30 +253,24 @@ class SignalTracker:
         # manual / unknown
         return None
 
-    async def _auto_postmortem(self, t: Tracker, reason: str) -> None:
-        """Tier 2:SL 命中后,自动跑 Claude 验尸,推 TG 报告。
-
-        规则(由 CLAUDE.md 强制):Claude 只分析、提建议,不 commit / push / 部署,
-        必须等用户在 TG 回 "执行"才动手。
-        """
-        if self.notifier is None:
-            return
-        # 等 5 秒,让前面的 ⛔ SL 提醒先送达
-        await asyncio.sleep(5)
-        try:
-            await self.notifier.send_text(
-                f"🔬 自动验尸中 [{t.signal_id[:8]}] (≤5min,Claude 在 Lightsail 跑)...",
-                parse_mode=None,
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-        prompt = (
-            f"信号 {t.signal_id} 刚命中 SL,自动验尸分析:\n"
-            f"- 方向: {t.direction}\n"
-            f"- entry: {t.entry}, SL: {t.sl}, TP1: {t.tp1}\n"
-            f"- ATR_4h at entry: {t.atr_4h}\n"
-            f"- 出场原因: {reason}({'tp1 后剩余仓 SL' if reason=='tp1_then_sl' else '全仓 SL'})\n"
+    @staticmethod
+    def build_postmortem_prompt(
+        signal_id: str,
+        direction: Optional[str],
+        entry: Optional[float],
+        sl: Optional[float],
+        tp1: Optional[float],
+        atr_4h: Optional[float],
+        reason: str,
+    ) -> str:
+        """构造验尸 prompt(SL 自动验尸 + 回填共用)。"""
+        reason_cn = "tp1 后剩余仓 SL" if reason == "tp1_then_sl" else "全仓 SL"
+        return (
+            f"信号 {signal_id} 命中 SL,验尸分析:\n"
+            f"- 方向: {direction}\n"
+            f"- entry: {entry}, SL: {sl}, TP1: {tp1}\n"
+            f"- ATR_4h at entry: {atr_4h}\n"
+            f"- 出场原因: {reason}({reason_cn})\n"
             f"\n请你做以下分析:\n"
             f"1. 查 data/market.db signals 表找这条信号的 SCORED breakdown / POI source / triggered_level\n"
             f"2. 查 systemd journal 看持仓期间(从 created_at 到 closed_at)的 STEP 推进 / invalidate / 4h 翻转事件\n"
@@ -289,6 +283,19 @@ class SignalTracker:
             f"5. ⚠️ 严格遵守 CLAUDE.md 规则:不要 commit / push / 部署,等用户在 TG 回 '执行' 才动手\n"
         )
 
+    async def run_postmortem(
+        self, signal_id: str, prompt: str, reason: str, timeout_s: int = 600
+    ) -> Dict[str, Any]:
+        """执行一次 Claude 验尸,落盘到 postmortems 表,返回结果字典。
+        共用入口:自动验尸 + /backfill_postmortems 都走这里。
+
+        返回 {"status", "output", "error_msg", "duration_ms"}.
+        status: 'success' / 'empty' / 'timeout' / 'error'
+        """
+        started_ms = int(time.time() * 1000)
+        full_output: Optional[str] = None
+        status = "error"
+        error_msg: Optional[str] = None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "claude", "-p", prompt,
@@ -299,23 +306,79 @@ class SignalTracker:
                 limit=8 * 1024 * 1024,
                 env={**os.environ},
             )
-            stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
-            output = stdout.decode("utf-8", errors="ignore").strip() or "(验尸无输出)"
-            # TG 4096 限,留余量
-            if len(output) > 3600:
-                output = output[:3600] + "\n...(truncated)"
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            full_output = stdout.decode("utf-8", errors="ignore").strip()
+            if not full_output:
+                status = "empty"
+                error_msg = (stderr.decode("utf-8", errors="ignore")[:500] or None)
+            else:
+                status = "success"
+        except asyncio.TimeoutError:
+            status = "timeout"
+            error_msg = f"claude -p {timeout_s}s 超时"
+        except Exception as e:  # noqa: BLE001
+            status = "error"
+            error_msg = repr(e)[:500]
+            logger.error(f"run_postmortem 失败 {signal_id[:8]}: {e}")
+        duration_ms = int(time.time() * 1000) - started_ms
+        # 不论成功失败都落盘
+        if self.db is not None:
+            try:
+                await self.db.save_postmortem(
+                    signal_id=signal_id,
+                    reason=reason,
+                    prompt=prompt,
+                    output=full_output,
+                    status=status,
+                    error_msg=error_msg,
+                    duration_ms=duration_ms,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"save_postmortem 失败 {signal_id[:8]}: {e}")
+        return {
+            "status": status,
+            "output": full_output,
+            "error_msg": error_msg,
+            "duration_ms": duration_ms,
+        }
+
+    async def _auto_postmortem(self, t: Tracker, reason: str) -> None:
+        """Tier 2:SL 命中后,自动跑 Claude 验尸,推 TG + 落盘。"""
+        if self.notifier is None:
+            return
+        # 等 5 秒,让前面的 ⛔ SL 提醒先送达
+        await asyncio.sleep(5)
+        try:
             await self.notifier.send_text(
-                f"🧠 验尸报告 [{t.signal_id[:8]}]:\n\n{output}",
+                f"🔬 自动验尸中 [{t.signal_id[:8]}] (≤5min,Claude 在 Lightsail 跑)...",
                 parse_mode=None,
             )
-        except asyncio.TimeoutError:
-            await self.notifier.send_text(f"⏱️ 验尸超时 [{t.signal_id[:8]}],10 分钟没出结果")
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"_auto_postmortem 失败 {t.signal_id[:8]}: {e}")
-            try:
-                await self.notifier.send_text(f"❌ 验尸异常 [{t.signal_id[:8]}]: {e}")
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception:  # noqa: BLE001
+            pass
+
+        prompt = self.build_postmortem_prompt(
+            signal_id=t.signal_id, direction=t.direction,
+            entry=t.entry, sl=t.sl, tp1=t.tp1, atr_4h=t.atr_4h,
+            reason=reason,
+        )
+        result = await self.run_postmortem(t.signal_id, prompt, reason)
+        status = result["status"]
+        full_output = result["output"]
+
+        if status == "success" and full_output:
+            tg_text = full_output if len(full_output) <= 3600 else full_output[:3600] + "\n...(truncated)"
+            await self.notifier.send_text(
+                f"🧠 验尸报告 [{t.signal_id[:8]}]:\n\n{tg_text}",
+                parse_mode=None,
+            )
+        elif status == "empty":
+            await self.notifier.send_text(f"⚠️ 验尸无输出 [{t.signal_id[:8]}]")
+        elif status == "timeout":
+            await self.notifier.send_text(f"⏱️ 验尸超时 [{t.signal_id[:8]}]")
+        else:
+            await self.notifier.send_text(
+                f"❌ 验尸异常 [{t.signal_id[:8]}]: {result.get('error_msg') or '未知错误'}"
+            )
 
     async def _persist(self, t: Tracker) -> None:
         if self.db is None:

@@ -114,6 +114,8 @@ class TelegramNotifier:
             self._app.add_handler(CommandHandler("status", self._cmd_status))
             self._app.add_handler(CommandHandler("close", self._cmd_close))
             self._app.add_handler(CommandHandler("ask", self._cmd_ask))
+            self._app.add_handler(CommandHandler("postmortems", self._cmd_postmortems))
+            self._app.add_handler(CommandHandler("backfill_postmortems", self._cmd_backfill_postmortems))
             self._app.add_handler(CommandHandler("help", self._cmd_help))
             self._app.add_handler(CommandHandler("start", self._cmd_help))
             # 文本按钮(ReplyKeyboard 点击后发来的是纯文本)
@@ -375,12 +377,42 @@ class TelegramNotifier:
                 parts.append(f"DB 查询异常: {_html_escape(str(e))}")
         await update.message.reply_text("\n".join(parts), parse_mode="HTML")
 
+    # /ask 会话 id 持久化文件(per-bot 单一会话,跨重启保留)
+    _ASK_SESSION_FILE = "/home/ubuntu/smcbot/data/ask_session.txt"
+
+    def _read_ask_session(self) -> Optional[str]:
+        try:
+            with open(self._ASK_SESSION_FILE, "r", encoding="utf-8") as f:
+                sid = f.read().strip()
+                return sid or None
+        except (FileNotFoundError, OSError):
+            return None
+
+    def _write_ask_session(self, session_id: Optional[str]) -> None:
+        try:
+            if session_id:
+                import os as _os
+                _os.makedirs(_os.path.dirname(self._ASK_SESSION_FILE), exist_ok=True)
+                with open(self._ASK_SESSION_FILE, "w", encoding="utf-8") as f:
+                    f.write(session_id.strip())
+            else:
+                import os as _os
+                try:
+                    _os.remove(self._ASK_SESSION_FILE)
+                except FileNotFoundError:
+                    pass
+        except OSError as e:
+            logger.error(f"写 ask_session 文件失败: {e}")
+
     async def _cmd_ask(self, update: Any, context: Any) -> None:
         """通过 TG 调用本机 Claude Code:让 Claude 查 / 改 / 部署 bot。
 
         - subprocess 跑 `claude -p <prompt>` 在 ~/smcbot 目录(自动加载 CLAUDE.md)
         - 用 OAuth token (Max subscription),不动 API balance
         - --dangerously-skip-permissions 让非交互模式不卡 permission 弹窗
+        - 默认 --resume <last_session_id> 保持上下文(2026-05-11);
+          第一次或 resume 失败时自动退回新会话。
+        - --output-format json 解析出 result + session_id,写回 ask_session 文件
         - 超长输出按 3800 字符分块发(TG 单条 4096 字符限)
         - 超时 15 分钟(够回测 + 部署)
         """
@@ -389,6 +421,7 @@ class TelegramNotifier:
         if not context.args:
             await update.message.reply_text(
                 "用法: /ask <问题>\n\n"
+                "上下文:默认续上次 /ask 会话(跨重启保留)。\n\n"
                 "示例:\n"
                 "  /ask 看下最近 6h 没信号是为什么\n"
                 "  /ask 把 4h_fvg 权重降到 0,跑 187d 回测看 ΣR\n"
@@ -396,62 +429,114 @@ class TelegramNotifier:
             )
             return
         prompt = " ".join(context.args)
+        last_sid = self._read_ask_session()
+        ctx_hint = f"续会话 {last_sid[:8]}" if last_sid else "新会话"
         start_msg = await update.message.reply_text(
-            f"🤔 Claude 正在处理 (≤15min)...\n\n{prompt}\n\n(每 60 秒一次进度)"
+            f"🤔 Claude 正在处理 (≤15min, {ctx_hint})...\n\n{prompt}\n\n(每 60 秒一次进度)"
         )
-        try:
+
+        async def _run(use_resume: bool) -> tuple:
+            """跑一次 claude,返回 (proc, stdout_bytes, stderr_bytes, retcode_or_None)。"""
+            args = ["claude", "-p", prompt,
+                    "--output-format", "json",
+                    "--dangerously-skip-permissions"]
+            if use_resume and last_sid:
+                args.extend(["--resume", last_sid])
             proc = await asyncio.create_subprocess_exec(
-                "claude", "-p", prompt,
-                "--dangerously-skip-permissions",
+                *args,
                 cwd="/home/ubuntu/smcbot",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=8 * 1024 * 1024,
                 env={**os.environ},
             )
-            # 边等边推心跳:每 60 秒回报一次"还活着,已经 N 分钟"
+            return proc
+
+        async def _wait_with_heartbeat(proc: Any) -> tuple:
+            """等 proc 结束,每 60s 推一次进度;15min 硬上限。
+            返回 (stdout_bytes, stderr_bytes) 或抛 TimeoutError / 业务异常。"""
             comm_task = asyncio.create_task(proc.communicate())
             elapsed = 0
-            try:
-                while not comm_task.done():
+            while not comm_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(comm_task), timeout=60)
+                    break
+                except asyncio.TimeoutError:
+                    elapsed += 60
+                    if elapsed >= 900:  # 15min 硬上限
+                        proc.kill()
+                        raise asyncio.TimeoutError("15min")
                     try:
-                        await asyncio.wait_for(asyncio.shield(comm_task), timeout=60)
-                        break
-                    except asyncio.TimeoutError:
-                        elapsed += 60
-                        if elapsed >= 900:  # 15min 硬上限
-                            proc.kill()
-                            await update.message.reply_text("⏱️ Claude 超时 15min,已取消")
-                            return
-                        try:
-                            await update.message.reply_text(
-                                f"⏳ 还在思考... 已 {elapsed//60} 分钟,继续等"
-                            )
-                        except Exception:  # noqa: BLE001
-                            pass
-                stdout, stderr = comm_task.result()
-            except Exception as e:  # noqa: BLE001
-                proc.kill()
-                await update.message.reply_text(f"❌ /ask 异常: {e}")
-                return
-            output = stdout.decode("utf-8", errors="ignore").strip()
-            if not output:
-                err_str = stderr.decode("utf-8", errors="ignore")[:600]
+                        await update.message.reply_text(
+                            f"⏳ 还在思考... 已 {elapsed//60} 分钟,继续等"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            return comm_task.result()
+
+        async def _parse_and_send(stdout_b: bytes, stderr_b: bytes, attempted_resume: bool) -> bool:
+            """解析 JSON 拿 result + session_id,把 result 发到 TG,session_id 写盘。
+            返回:True = 成功完成;False = 命中"resume 失败"信号,调用方该 fallback 重试。"""
+            raw = stdout_b.decode("utf-8", errors="ignore").strip()
+            err_str = stderr_b.decode("utf-8", errors="ignore")[:600] if stderr_b else ""
+            if not raw:
+                await update.message.reply_text(f"⚠️ Claude 没输出。\n\nstderr:\n{err_str}")
+                return True
+            # 解析 JSON(output-format=json 单行 result)
+            import json as _json
+            try:
+                obj = _json.loads(raw)
+            except _json.JSONDecodeError:
+                # 非 JSON 输出(如启动错误前的明文 stderr 拼回 stdout),直接当文本发
+                await update.message.reply_text(f"💡 Claude(原文):\n\n{raw[:3800]}", parse_mode=None)
+                return True
+            result_text = (obj.get("result") or "").strip()
+            new_sid = obj.get("session_id")
+            is_error = bool(obj.get("is_error"))
+            # 如果是 resume 失败的典型错误,告诉调用方 fallback
+            if attempted_resume and is_error and "session" in result_text.lower():
+                logger.warning(f"resume 失败,fallback 新会话: {result_text[:200]}")
+                return False
+            if not result_text:
                 await update.message.reply_text(
-                    f"⚠️ Claude 没输出。\n\nstderr:\n{err_str}"
+                    f"⚠️ Claude 输出无 result 字段。\n原文:{raw[:500]}\nstderr:{err_str}"
                 )
-                return
+                return True
+            # 保存新的 session_id(为下次 /ask 续上)
+            if new_sid:
+                self._write_ask_session(new_sid)
+            # 头部带上下文提示
+            header = f"💡 Claude ({'续' if attempted_resume else '新'} {new_sid[:8] if new_sid else '?'}):\n\n"
             # 分块发送
             max_chunk = 3800
-            if len(output) <= max_chunk:
-                await update.message.reply_text(f"💡 Claude:\n\n{output}", parse_mode=None)
+            if len(header) + len(result_text) <= max_chunk:
+                await update.message.reply_text(header + result_text, parse_mode=None)
             else:
-                chunks = [output[i:i + max_chunk] for i in range(0, len(output), max_chunk)]
+                chunks = [result_text[i:i + max_chunk] for i in range(0, len(result_text), max_chunk)]
                 for i, chunk in enumerate(chunks, 1):
-                    await update.message.reply_text(
-                        f"💡 Claude ({i}/{len(chunks)}):\n\n{chunk}",
-                        parse_mode=None,
-                    )
+                    prefix = header if i == 1 else f"💡 Claude ({i}/{len(chunks)}):\n\n"
+                    await update.message.reply_text(prefix + chunk, parse_mode=None)
+            return True
+
+        try:
+            proc = await _run(use_resume=bool(last_sid))
+            try:
+                stdout, stderr = await _wait_with_heartbeat(proc)
+            except asyncio.TimeoutError:
+                await update.message.reply_text("⏱️ Claude 超时 15min,已取消")
+                return
+            ok = await _parse_and_send(stdout, stderr, attempted_resume=bool(last_sid))
+            if not ok:
+                # resume 失败 → 清掉旧 session_id 重试一次(新会话)
+                self._write_ask_session(None)
+                await update.message.reply_text("🆕 上次会话不可恢复,重开新会话重试...")
+                proc2 = await _run(use_resume=False)
+                try:
+                    stdout2, stderr2 = await _wait_with_heartbeat(proc2)
+                except asyncio.TimeoutError:
+                    await update.message.reply_text("⏱️ 新会话重试也超时 15min")
+                    return
+                await _parse_and_send(stdout2, stderr2, attempted_resume=False)
         except Exception as e:  # noqa: BLE001
             await update.message.reply_text(f"❌ /ask 调用失败: {e}")
 
@@ -478,6 +563,134 @@ class TelegramNotifier:
                 f"✅ tracker 已关闭: {closed.signal_id[:8]} "
                 f"({closed.direction} entry={closed.entry:.2f})"
             )
+
+    async def _cmd_postmortems(self, update: Any, context: Any) -> None:
+        """查最近 N 份验尸,或按 sid 前缀查具体一份。
+        用法:/postmortems        → 最近 5 份摘要
+              /postmortems 10    → 最近 10 份
+              /postmortems <sid> → 该 sid 的完整 output(分块)
+        """
+        if not self._is_authorized(update):
+            return
+        if self._db is None:
+            await update.message.reply_text("⚠️ db 未注入")
+            return
+        arg = (context.args[0].strip() if context.args else "")
+        # 按 sid 前缀查
+        if arg and not arg.isdigit():
+            rows = await self._db.recent_postmortems(limit=20)
+            rows = [r for r in rows if str(r.get("signal_id","")).startswith(arg)]
+            if not rows:
+                await update.message.reply_text(f"未找到验尸:sid={arg}")
+                return
+            r = rows[0]
+            from datetime import datetime as _dt
+            ts = _dt.fromtimestamp(int(r.get("created_at") or 0)).strftime("%Y-%m-%d %H:%M:%S")
+            header = (
+                f"🧠 验尸 [{r['signal_id'][:8]}] {r.get('reason','?')}\n"
+                f"时间: {ts}  状态: {r.get('status','?')}  耗时: {(r.get('duration_ms') or 0)//1000}s\n"
+                f"━━━━━━━━━━\n"
+            )
+            body = r.get("output") or f"(无 output;error_msg={r.get('error_msg')})"
+            text = header + body
+            max_chunk = 3800
+            if len(text) <= max_chunk:
+                await update.message.reply_text(text, parse_mode=None)
+            else:
+                chunks = [text[i:i+max_chunk] for i in range(0, len(text), max_chunk)]
+                for i, c in enumerate(chunks, 1):
+                    await update.message.reply_text(f"({i}/{len(chunks)})\n{c}", parse_mode=None)
+            return
+        # 按 N 查最近列表
+        limit = int(arg) if arg.isdigit() else 5
+        limit = max(1, min(limit, 20))
+        rows = await self._db.recent_postmortems(limit=limit)
+        if not rows:
+            await update.message.reply_text("📭 无验尸记录")
+            return
+        from datetime import datetime as _dt
+        lines = [f"🧠 最近 {len(rows)} 份验尸:\n"]
+        for r in rows:
+            ts = _dt.fromtimestamp(int(r.get("created_at") or 0)).strftime("%m-%d %H:%M")
+            out = (r.get("output") or "")[:140].replace("\n", " ")
+            lines.append(
+                f"[{r['signal_id'][:8]}] {ts} {r.get('reason'):>14} "
+                f"{r.get('status'):>8}  {out}..."
+            )
+        lines.append("\n查全文:/postmortems <sid 前缀>")
+        await update.message.reply_text("\n".join(lines), parse_mode=None)
+
+    async def _cmd_backfill_postmortems(self, update: Any, context: Any) -> None:
+        """对所有 outcome=sl/tp1_then_sl 但还没有 postmortems 记录的信号补跑验尸。
+        串行执行(避免并发打爆 Claude),每完成一条推一行进度。
+        用法:/backfill_postmortems         → 跑全部缺失
+              /backfill_postmortems 3      → 只跑前 3 条(测试用)
+        """
+        if not self._is_authorized(update):
+            return
+        if self._db is None or self._tracker is None:
+            await update.message.reply_text("⚠️ db 或 tracker 未注入")
+            return
+        max_n = int(context.args[0]) if (context.args and context.args[0].isdigit()) else 100
+
+        # 查所有 SL/tp1_then_sl 信号
+        rows = await self._db.recent_signals(hours=24 * 365, limit=500, include_scored=False)
+        sl_rows = [r for r in rows if (r.get("outcome") in ("sl", "tp1_then_sl"))]
+        # 排除已有 postmortems
+        existing = await self._db.recent_postmortems(limit=500)
+        done_sids = {p["signal_id"] for p in existing}
+        todo = [r for r in sl_rows if r["signal_id"] not in done_sids]
+        todo = todo[:max_n]
+
+        if not todo:
+            await update.message.reply_text(
+                f"✅ 无需回填:{len(sl_rows)} 个 SL 信号都已有验尸"
+            )
+            return
+        await update.message.reply_text(
+            f"🔬 开始回填 {len(todo)} 份验尸(串行,预计 {len(todo)*3}-{len(todo)*8} 分钟)..."
+        )
+
+        # 把 build_postmortem_prompt + run_postmortem 接出来
+        build_prompt = self._tracker.build_postmortem_prompt
+        run = self._tracker.run_postmortem
+
+        ok = 0
+        err = 0
+        for i, r in enumerate(todo, 1):
+            sid = r["signal_id"]
+            reason = r.get("outcome") or "sl"
+            prompt = build_prompt(
+                signal_id=sid,
+                direction=r.get("direction"),
+                entry=r.get("entry_price"),
+                sl=r.get("stop_loss"),
+                tp1=r.get("take_profit"),
+                atr_4h=None,  # signals 表没存 ATR;Claude prompt 容许 None
+                reason=reason,
+            )
+            try:
+                result = await run(sid, prompt, reason)
+                if result["status"] == "success":
+                    ok += 1
+                    tag = "✓"
+                else:
+                    err += 1
+                    tag = f"✗({result['status']})"
+            except Exception as e:  # noqa: BLE001
+                err += 1
+                tag = f"✗({type(e).__name__})"
+                logger.error(f"backfill {sid[:8]} 异常: {e}")
+            try:
+                await update.message.reply_text(
+                    f"[{i}/{len(todo)}] {tag} {sid[:8]} {reason}"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        await update.message.reply_text(
+            f"🏁 回填完成:成功 {ok} / 失败 {err} / 共 {len(todo)}。\n"
+            f"查看:/postmortems  或  /postmortems <sid>"
+        )
 
     async def _cmd_help(self, update: Any, context: Any) -> None:
         if not self._is_authorized(update):

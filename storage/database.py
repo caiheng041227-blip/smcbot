@@ -115,6 +115,21 @@ SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_failed_pois_status ON failed_pois(status, symbol)",
+    """
+    CREATE TABLE IF NOT EXISTS postmortems (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id    TEXT NOT NULL,
+        reason       TEXT NOT NULL,           -- 'sl' / 'tp1_then_sl'
+        prompt       TEXT,                    -- 喂给 Claude 的 prompt 全文
+        output       TEXT,                    -- Claude 返回的报告全文
+        status       TEXT NOT NULL,           -- 'success' / 'timeout' / 'error' / 'empty'
+        error_msg    TEXT,                    -- 异常或 stderr 简述
+        duration_ms  INTEGER,                 -- Claude 调用耗时
+        created_at   INTEGER NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_postmortems_signal ON postmortems(signal_id)",
+    "CREATE INDEX IF NOT EXISTS idx_postmortems_created ON postmortems(created_at DESC)",
 ]
 
 
@@ -387,6 +402,50 @@ class Database:
             n = cur.rowcount
         await self._conn.commit()
         return n
+
+    # ---- postmortems(Tier 2 验尸落盘)----------------------------------
+
+    async def save_postmortem(
+        self,
+        signal_id: str,
+        reason: str,
+        prompt: str,
+        output: Optional[str],
+        status: str,
+        error_msg: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+    ) -> int:
+        """落盘一份 Tier 2 验尸报告(prompt + Claude 输出)。
+        status: 'success' / 'timeout' / 'error' / 'empty'
+        """
+        assert self._conn is not None
+        now = int(time.time())
+        async with self._conn.execute(
+            """
+            INSERT INTO postmortems
+              (signal_id, reason, prompt, output, status, error_msg, duration_ms, created_at)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (signal_id, reason, prompt, output, status, error_msg, duration_ms, now),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._conn.commit()
+        return row_id
+
+    async def recent_postmortems(
+        self, limit: int = 10, signal_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """查最近 N 份验尸,可选按 signal_id 过滤。"""
+        assert self._conn is not None
+        if signal_id:
+            sql = "SELECT * FROM postmortems WHERE signal_id=? ORDER BY created_at DESC LIMIT ?"
+            params: tuple = (signal_id, int(limit))
+        else:
+            sql = "SELECT * FROM postmortems ORDER BY created_at DESC LIMIT ?"
+            params = (int(limit),)
+        async with self._conn.execute(sql, params) as cur:
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, row)) for row in await cur.fetchall()]
 
     async def update_signal_outcome(
         self, signal_id: str, outcome: str, pnl_r: Optional[float] = None
