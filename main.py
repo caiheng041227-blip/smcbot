@@ -245,6 +245,22 @@ async def main_async() -> None:
     else:
         logger.warning("未配置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，通知将只输出到日志")
 
+    # Pattern Matcher:NOTIFIED 信号触发时附带历史相似走势对比图
+    # 失败 / 历史不足都完全静默,不影响主流程
+    pattern_matcher = None
+    try:
+        from engine.pattern_matcher import PatternMatcher
+        pattern_matcher = PatternMatcher(
+            db_path=str(db_path), telegram=notifier, symbol=symbol, timeframe="1h",
+        )
+        # load_history 内部已硬卡 MIN_HISTORY_BARS=17000(约 2 年),不足时返回 0
+        n_hist = await pattern_matcher.load_history()
+        if n_hist == 0:
+            pattern_matcher = None  # load 内部已 log 原因
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"PatternMatcher 初始化失败 (不影响主流程): {e}")
+        pattern_matcher = None
+
     # K 线 close 回调：打印 + 落盘 + 切换 per-bar delta + 驱动状态机
     def on_candle_close(sym: str, tf: str, c: Candle) -> None:
         # 主品种才切 delta bar + 驱状态机;ref_symbol(BTC)仅存 candle 供 correlation gate 读
@@ -270,6 +286,14 @@ async def main_async() -> None:
             # IFVG 二次入场:1h 收盘时扫 failed_pois 看是否回踩
             if tf == "1h":
                 asyncio.create_task(engine.check_ifvg_reentry(sym, c, db))
+                # PatternMatcher 增量追加新 K(每 1h 一次,O(N) 重算 ~10ms)
+                if pattern_matcher is not None:
+                    try:
+                        pattern_matcher.append_candle(
+                            c.open_time, c.open, c.high, c.low, c.close, c.volume
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.error(f"PatternMatcher.append_candle 失败: {e}")
 
     # REST 回填 + 状态回放:在订阅 close 回调之前灌入历史数据,并用近 N 小时
     # 的 K 线重放驱动 state_machine,恢复 active_signals(Step1/2/3/5 in-flight)。
@@ -413,6 +437,15 @@ async def main_async() -> None:
                         await tracker.add(s, atr_4h)
                     except Exception as e:  # noqa: BLE001
                         logger.error(f"tracker.add 失败 {s.signal_id[:8]}: {e}")
+                    # Pattern Matcher 异步附带历史相似走势图(不阻塞主流程)
+                    if pattern_matcher is not None:
+                        sig_dict = {
+                            "signal_id": s.signal_id,
+                            "notified_at": int(time.time() * 1000),
+                            "direction": s.direction,
+                            "entry_price": s.entry_price,
+                        }
+                        asyncio.create_task(pattern_matcher.process_signal(sig_dict))
             except Exception as e:
                 logger.error(f"notify_loop 异常: {e}")
             await asyncio.sleep(5)
