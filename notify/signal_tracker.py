@@ -274,13 +274,9 @@ class SignalTracker:
             f"\n请你做以下分析:\n"
             f"1. 查 data/market.db signals 表找这条信号的 SCORED breakdown / POI source / triggered_level\n"
             f"2. 查 systemd journal 看持仓期间(从 created_at 到 closed_at)的 STEP 推进 / invalidate / 4h 翻转事件\n"
-            f"3. 查 signals 表近 5 次 outcome 含 'sl' 的信号,找共性(POI 源 / 方向 / score 区间 / 持仓时长)\n"
-            f"4. 输出 3 段(总长 < 800 字,中文,准确精炼,不要废话):\n"
-            f"   ① 直接原因(2-3 句:具体哪根 K 反向 / 哪个条件失效)\n"
-            f"   ② 与近 5 次 SL 的共性模式(短列表,每条一句话)\n"
-            f"   ③ 改进建议:用自然语言描述要调什么、调到多少、依据是什么。"
-            f"不要写代码、不要给文件路径或行号、不要贴 diff,只要让我读完知道'调哪个参数 / 加什么条件 / 移除什么逻辑'。\n"
-            f"5. ⚠️ 严格遵守 CLAUDE.md 规则:不要 commit / push / 部署,等用户在 TG 回 '执行' 才动手\n"
+            f"3. 输出直接原因分析(总长 < 300 字,中文,准确精炼,不要废话,不要 markdown 标题符号):\n"
+            f"   具体哪根 K 线触发 SL / 哪个条件在入场前就已失效 / 持仓期间量价结构如何变化。\n"
+            f"4. ⚠️ 严格遵守 CLAUDE.md 规则:不要 commit / push / 部署,等用户在 TG 回 '执行' 才动手\n"
         )
 
     async def run_postmortem(
