@@ -105,6 +105,26 @@ ssh -i ~/Downloads/LightsailDefaultKey-eu-west-2.pem ubuntu@51.24.19.178 \
   'sudo systemctl restart smcbot && sudo journalctl -u smcbot -n 30 --no-pager'
 ```
 
+### 查当前走势的历史相似走势(本地工具,不影响 live)
+
+```bash
+# 默认 ETHUSDT,从本地 GB 读 8 年历史 + OKX 补最近,~4 秒出结果
+python scripts/_find_similar_now.py
+
+# 切 BTCUSDT
+python scripts/_find_similar_now.py --symbol BTCUSDT
+
+# 跳过 OKX 补齐,纯 GB(更快但 anchor 不是最新)
+python scripts/_find_similar_now.py --offline
+```
+
+输出:当前 anchor 宏观(MA30/MA90/年内位置/MA90 趋势/180d Fib 档位)+ Top 3 跨时段历史相似窗口(72/120/168h 综合 cosine,5 维宏观 gate)+ 每个 Top 后续 48h 实际走向。
+
+**注意**:本地 [data/market.db](data/market.db) 是工具用 GB(8 年 Binance 1h),跟 live 完全隔离。**这些文件不要 push 到 GitHub**,Lightsail 内存(911MB)装不下 8 年滑窗矩阵会爆 OOM,**纯本地工具**:
+
+- [scripts/_find_similar_now.py](scripts/_find_similar_now.py)
+- [scripts/backfill_history_binance.py](scripts/backfill_history_binance.py)(刷新 GB 用)
+
 启动后 `replay_recent_state` 会自动回放近 24h K 线重建 active_signals(config.yaml 的 `replay_hours: 24` 控制),不再每次部署丢失 in-flight 信号。
 
 ## 关键文件速查
