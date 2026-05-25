@@ -211,10 +211,20 @@ def format_signal(signal: Any) -> str:
     sweep = _get(signal, "liquidity_sweep_candle")
     scores = _get(signal, "scores") or {}
 
-    trade_lines = [
-        "💰 交易参数:",
-        f"• 入场价: {_fmt_price(entry_price)}",
-    ]
+    # 2026-05-24:入场模式
+    #   limit     - POI 边界外侧 buffer 挂单,等价格回测才成交
+    #   immediate - IFVG / fallback,立即按 entry 入场
+    entry_mode = (_get(signal, "entry_mode") or "limit").lower()
+    is_limit = (entry_mode == "limit")
+    dir_cn_short = "做空" if not is_long else "做多"
+
+    trade_lines = ["💰 交易参数:"]
+    if is_limit:
+        trade_lines.append(
+            f"• 📋 挂单{dir_cn_short} @ {_fmt_price(entry_price)}(等价格回测此位成交)"
+        )
+    else:
+        trade_lines.append(f"• 入场价: {_fmt_price(entry_price)}")
     # SL / TP / RR 都由用户手动决定,仅当信号里真的带了才展示(当前正常路径下都为 None)
     if stop_loss is not None:
         sl_pct = _pct(stop_loss, entry_price)
@@ -231,7 +241,11 @@ def format_signal(signal: Any) -> str:
     if take_profit is not None and entry_price is not None and stop_loss is not None:
         trade_lines.append(f"• TP1(建议平 50%): {_fmt_price(take_profit)}")
         trade_lines.append("• TP2(剩余 50%): 达 TP1 后启用 peak − 1.5×ATR_4h 移动止盈")
-        trade_lines.append("• bot 会在 TP1 / TP2 / SL 命中时发 TG 提醒")
+        if is_limit:
+            trade_lines.append("• bot 会在 limit 成交 / TP1 / TP2 / SL 命中时发 TG 提醒")
+            trade_lines.append("• ⏱️ Limit 24h 未成交 → 自动作废")
+        else:
+            trade_lines.append("• bot 会在 TP1 / TP2 / SL 命中时发 TG 提醒")
     else:
         trade_lines.append("• 止损 / 目标由你自行判断")
 
@@ -244,7 +258,7 @@ def format_signal(signal: Any) -> str:
         "📊 信号详情:",
         f"• 流动性猎取: {_format_sweep(sweep)}",
         f"• POI 类型: {_format_poi(poi_type, poi_low, poi_high)}",
-        "• 止损依据: POI 对侧边界",
+        "• 止损依据: POI 对侧边界 + 0.15×ATR_4h 缓冲",
         "",
         *trade_lines,
         "",

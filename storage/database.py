@@ -148,6 +148,15 @@ class Database:
             cols = {row[1] for row in await cur.fetchall()}
         if "scored_at" not in cols:
             await self._conn.execute("ALTER TABLE signals ADD COLUMN scored_at INTEGER")
+        # 增量迁移:signal_trackers 加 entry_pending / entry_filled_at(2026-05-24 limit 挂单)
+        async with self._conn.execute("PRAGMA table_info(signal_trackers)") as cur:
+            tcols = {row[1] for row in await cur.fetchall()}
+        if "entry_pending" not in tcols:
+            await self._conn.execute(
+                "ALTER TABLE signal_trackers ADD COLUMN entry_pending INTEGER NOT NULL DEFAULT 0"
+            )
+        if "entry_filled_at" not in tcols:
+            await self._conn.execute("ALTER TABLE signal_trackers ADD COLUMN entry_filled_at INTEGER")
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -470,14 +479,17 @@ class Database:
     async def upsert_tracker(self, t: Any) -> None:
         """写入/更新 signal_trackers 行。t 是 Tracker dataclass,按字段名读取。"""
         assert self._conn is not None
+        entry_pending_val = 1 if getattr(t, "entry_pending", False) else 0
+        entry_filled_at_val = getattr(t, "entry_filled_at", None)
         await self._conn.execute(
             """
             INSERT INTO signal_trackers (
                 signal_id, symbol, direction, entry, sl, tp1,
                 atr_4h, trail_mult, tp1_portion,
                 created_at, tp1_hit_at, tp1_hit_price, peak,
-                closed_at, close_reason
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                closed_at, close_reason,
+                entry_pending, entry_filled_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(signal_id) DO UPDATE SET
                 atr_4h=excluded.atr_4h,
                 trail_mult=excluded.trail_mult,
@@ -486,13 +498,16 @@ class Database:
                 tp1_hit_price=excluded.tp1_hit_price,
                 peak=excluded.peak,
                 closed_at=excluded.closed_at,
-                close_reason=excluded.close_reason
+                close_reason=excluded.close_reason,
+                entry_pending=excluded.entry_pending,
+                entry_filled_at=excluded.entry_filled_at
             """,
             (
                 t.signal_id, t.symbol, t.direction, t.entry, t.sl, t.tp1,
                 t.atr_4h, t.trail_mult, t.tp1_portion,
                 t.created_at, t.tp1_hit_at, t.tp1_hit_price, t.peak,
                 t.closed_at, t.close_reason,
+                entry_pending_val, entry_filled_at_val,
             ),
         )
         await self._conn.commit()

@@ -93,12 +93,43 @@ def simulate_outcome(
     tp: float,
     future_bars: List[dict],
     max_hours: int = 72,
+    entry_mode: str = "limit",
+    limit_ttl_hours: int = 24,
 ) -> Dict[str, object]:
     """从 sig_time_ms 之后的 K 线前瞻,找先触及 SL 还是 TP。
     max_hours 现在是"信号后多少根 bar"(不管 bar 粒度)。
+
+    2026-05-24:支持 limit 挂单
+      - entry_mode='limit':先等回测到 entry(TTL=limit_ttl_hours h),否则 expired_unfilled
+      - entry_mode='immediate':立即按 entry 起算(IFVG / 回退路径)
     """
     bars_after = 0
-    for k in future_bars:
+    # ---- limit 模式:先等 fill ----
+    fill_idx = -1
+    fill_bars = 0
+    if entry_mode == "limit":
+        for idx, k in enumerate(future_bars):
+            if int(k["t"]) <= sig_time_ms:
+                continue
+            fill_bars += 1
+            if fill_bars > limit_ttl_hours:
+                return {"outcome": "expired_unfilled", "pnl_r": 0.0,
+                        "bars": fill_bars, "fill_bars": fill_bars}
+            hi, lo = float(k["h"]), float(k["l"])
+            if direction == "short" and hi >= entry:
+                fill_idx = idx
+                break
+            if direction == "long" and lo <= entry:
+                fill_idx = idx
+                break
+        if fill_idx < 0:
+            return {"outcome": "expired_unfilled", "pnl_r": 0.0,
+                    "bars": fill_bars, "fill_bars": fill_bars}
+        bars_iter = future_bars[fill_idx + 1:]
+    else:
+        bars_iter = future_bars
+
+    for k in bars_iter:
         if int(k["t"]) <= sig_time_ms:
             continue
         bars_after += 1
@@ -113,11 +144,11 @@ def simulate_outcome(
             tp_hit = lo <= tp
         # 保守口径:同一根 K 内先触 SL(避免高估 TP 命中)
         if sl_hit:
-            return {"outcome": "sl", "pnl_r": -1.0, "bars": bars_after}
+            return {"outcome": "sl", "pnl_r": -1.0, "bars": bars_after, "fill_bars": fill_bars}
         if tp_hit:
             r = abs(tp - entry) / abs(entry - sl) if entry != sl else 0.0
-            return {"outcome": "tp", "pnl_r": round(r, 2), "bars": bars_after}
-    return {"outcome": "pending", "pnl_r": 0.0, "bars": bars_after}
+            return {"outcome": "tp", "pnl_r": round(r, 2), "bars": bars_after, "fill_bars": fill_bars}
+    return {"outcome": "pending", "pnl_r": 0.0, "bars": bars_after, "fill_bars": fill_bars}
 
 
 def simulate_outcome_hybrid(
@@ -131,21 +162,62 @@ def simulate_outcome_hybrid(
     max_hours: int = 168,
     tp1_portion: float = 0.5,
     trail_atr_mult: float = 1.5,
+    entry_mode: str = "limit",
+    limit_ttl_hours: int = 24,
 ) -> Dict[str, object]:
     """混合出场:SL 全仓 / TP1 平 `tp1_portion`(结构 TP)/ 剩余用 peak - `trail_atr_mult` × ATR_4h 追踪止盈。
 
+    2026-05-24:支持 limit 挂单模式
+      - entry_mode='limit':先等价格回测到 entry(SHORT: hi≥entry; LONG: lo≤entry)
+        才算成交;超过 limit_ttl_hours 未触达 → 'expired_unfilled'
+      - entry_mode='immediate':立即按 entry 起算(IFVG / 回退路径)
+
     仓位单位化:初始 1.0,按比例减仓后更新 remaining。
-    返回 {outcome, pnl_r, bars, tp1_hit, trail_price(若触发)}。
-    - outcome:'sl' / 'tp1_only'(TP1 但 trail 未闭)/ 'tp1_trail' / 'pending'
-    - pnl_r:合计 R(以 entry 到 SL 的全仓风险为 1 单位)
+    返回 {outcome, pnl_r, bars, tp1_hit, trail_price(若触发), fill_bars}。
+    - outcome:'sl' / 'tp1_only' / 'tp1_trail' / 'pending' / 'expired_unfilled'
+    - pnl_r:合计 R(以 entry 到 SL 的全仓风险为 1 单位);未成交时 0
     """
     if entry is None or sl is None or tp is None or entry == sl:
-        return {"outcome": "pending", "pnl_r": 0.0, "bars": 0, "tp1_hit": False}
+        return {"outcome": "pending", "pnl_r": 0.0, "bars": 0, "tp1_hit": False, "fill_bars": 0}
     risk = abs(entry - sl)
     if risk <= 0:
-        return {"outcome": "pending", "pnl_r": 0.0, "bars": 0, "tp1_hit": False}
+        return {"outcome": "pending", "pnl_r": 0.0, "bars": 0, "tp1_hit": False, "fill_bars": 0}
     # 安全兜底:ATR 缺失时 trail 距离用 0.5R(就近跟)
     trail_dist = trail_atr_mult * atr_4h if atr_4h and atr_4h > 0 else 0.5 * risk
+
+    # ---- limit 模式:先等 fill,再跑 TP/SL ----
+    fill_idx = -1
+    fill_bars = 0
+    if entry_mode == "limit":
+        for idx, k in enumerate(future_bars):
+            if int(k["t"]) <= sig_time_ms:
+                continue
+            fill_bars += 1
+            if fill_bars > limit_ttl_hours:
+                # 超过 TTL 未成交,信号作废
+                return {"outcome": "expired_unfilled", "pnl_r": 0.0,
+                        "bars": fill_bars, "tp1_hit": False, "fill_bars": fill_bars}
+            hi, lo = float(k["h"]), float(k["l"])
+            # SHORT: 价格上探到 entry → 卖单成交
+            # LONG:  价格下探到 entry → 买单成交
+            if direction == "short" and hi >= entry:
+                fill_idx = idx
+                break
+            if direction == "long" and lo <= entry:
+                fill_idx = idx
+                break
+        else:
+            # future_bars 用尽仍未成交
+            return {"outcome": "expired_unfilled", "pnl_r": 0.0,
+                    "bars": fill_bars, "tp1_hit": False, "fill_bars": fill_bars}
+        if fill_idx < 0:
+            return {"outcome": "expired_unfilled", "pnl_r": 0.0,
+                    "bars": fill_bars, "tp1_hit": False, "fill_bars": fill_bars}
+        # 从 fill 这根 K 之后开始跑 TP/SL(本根不在同一根里判,避免一根 K 内 fill+SL 同时触发)
+        bars_iter = future_bars[fill_idx + 1:]
+    else:
+        # immediate 模式:从 sig_time 之后立即开始
+        bars_iter = future_bars
 
     peak = entry
     tp1_hit = False
@@ -153,7 +225,7 @@ def simulate_outcome_hybrid(
     remaining = 1.0
     bars_after = 0
 
-    for k in future_bars:
+    for k in bars_iter:
         if int(k["t"]) <= sig_time_ms:
             continue
         bars_after += 1
@@ -166,7 +238,7 @@ def simulate_outcome_hybrid(
             if lo <= sl:
                 realized_r += remaining * (sl - entry) / risk  # = -remaining
                 return {"outcome": "sl", "pnl_r": round(realized_r, 3),
-                        "bars": bars_after, "tp1_hit": tp1_hit}
+                        "bars": bars_after, "tp1_hit": tp1_hit, "fill_bars": fill_bars}
             if not tp1_hit and hi >= tp:
                 realized_r += tp1_portion * (tp - entry) / risk
                 remaining -= tp1_portion
@@ -179,13 +251,14 @@ def simulate_outcome_hybrid(
                 if lo <= trail_stop and trail_stop > entry:
                     realized_r += remaining * (trail_stop - entry) / risk
                     return {"outcome": "tp1_trail", "pnl_r": round(realized_r, 3),
-                            "bars": bars_after, "tp1_hit": True, "trail_price": trail_stop}
+                            "bars": bars_after, "tp1_hit": True, "trail_price": trail_stop,
+                            "fill_bars": fill_bars}
                 # trail_stop 仍在 entry 下方时,兜底让 SL 继续起作用
         else:
             if hi >= sl:
                 realized_r += remaining * (entry - sl) / risk  # = -remaining(short: entry<sl)
                 return {"outcome": "sl", "pnl_r": round(realized_r, 3),
-                        "bars": bars_after, "tp1_hit": tp1_hit}
+                        "bars": bars_after, "tp1_hit": tp1_hit, "fill_bars": fill_bars}
             if not tp1_hit and lo <= tp:
                 realized_r += tp1_portion * (entry - tp) / risk
                 remaining -= tp1_portion
@@ -198,7 +271,8 @@ def simulate_outcome_hybrid(
                 if hi >= trail_stop and trail_stop < entry:
                     realized_r += remaining * (entry - trail_stop) / risk
                     return {"outcome": "tp1_trail", "pnl_r": round(realized_r, 3),
-                            "bars": bars_after, "tp1_hit": True, "trail_price": trail_stop}
+                            "bars": bars_after, "tp1_hit": True, "trail_price": trail_stop,
+                            "fill_bars": fill_bars}
 
     # 时间窗到期或数据用尽
     if tp1_hit:
@@ -209,8 +283,9 @@ def simulate_outcome_hybrid(
         else:
             realized_r += remaining * (entry - last_close) / risk
         return {"outcome": "tp1_only", "pnl_r": round(realized_r, 3),
-                "bars": bars_after, "tp1_hit": True}
-    return {"outcome": "pending", "pnl_r": 0.0, "bars": bars_after, "tp1_hit": False}
+                "bars": bars_after, "tp1_hit": True, "fill_bars": fill_bars}
+    return {"outcome": "pending", "pnl_r": 0.0, "bars": bars_after, "tp1_hit": False,
+            "fill_bars": fill_bars}
 
 
 # --- 主回测流程 ------------------------------------------------------------
@@ -449,6 +524,7 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
                 "source": s.poi_source,
                 "poi_low": s.poi_low,
                 "poi_high": s.poi_high,
+                "entry_mode": getattr(s, "entry_mode", "limit"),
                 "notified": True,
                 "scores": dict(s.scores or {}),
                 "_content_key": ck,
@@ -475,6 +551,7 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
                     "source": s.poi_source,
                     "poi_low": s.poi_low,
                     "poi_high": s.poi_high,
+                    "entry_mode": getattr(s, "entry_mode", "limit"),
                     "notified": False,
                     "scores": dict(s.scores or {}),
                     "_content_key": ck,
@@ -545,6 +622,8 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
         out = simulate_outcome(
             sig["time"], sig["direction"], sig["entry"], sl_sim, tp_sim, future_1h,
             max_hours=168,
+            entry_mode=sig.get("entry_mode", "limit"),
+            limit_ttl_hours=24,
         )
         merged = {**sig, **out}
         # 并行跑 hybrid(仅当启用),与 baseline 对比,不替换
@@ -554,10 +633,13 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
                 sig["time"], sig["direction"], sig["entry"], sl_sim, tp_sim,
                 float(atr_4h_at_sig), future_1h, max_hours=168,
                 tp1_portion=tp1_portion, trail_atr_mult=trail_atr_mult,
+                entry_mode=sig.get("entry_mode", "limit"),
+                limit_ttl_hours=24,
             )
             merged["hybrid_outcome"] = hy.get("outcome")
             merged["hybrid_pnl_r"] = hy.get("pnl_r")
             merged["hybrid_tp1_hit"] = hy.get("tp1_hit")
+            merged["hybrid_fill_bars"] = hy.get("fill_bars")
         results.append(merged)
 
     # === IFVG 二次入场模拟(对 NOTIFIED 4h_fvg + outcome=sl 的信号,反向触发)===
@@ -629,6 +711,7 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
                 ifvg["entry_time_ms"], r["direction"], ifvg["entry"], ifvg["sl"], ifvg["tp"],
                 atr_4h_at_sig, future_after, max_hours=168,
                 tp1_portion=tp1_portion, trail_atr_mult=trail_atr_mult,
+                entry_mode="immediate",  # IFVG 二次入场是回踩即成交,不走 limit 等待
             )
             ifvg_rec["hybrid_outcome"] = hy.get("outcome")
             ifvg_rec["hybrid_pnl_r"] = hy.get("pnl_r")

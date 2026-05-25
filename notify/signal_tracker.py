@@ -26,22 +26,31 @@ class Tracker:
     signal_id: str
     symbol: str
     direction: str           # 'long' | 'short'
-    entry: float
+    entry: float             # limit 模式:挂单价(POI 外侧);immediate 模式:即时入场价
     sl: float
     tp1: float
     atr_4h: float
     trail_mult: float = 1.5
     tp1_portion: float = 0.5
     created_at: int = 0
+    # 2026-05-24:limit 挂单状态
+    #   entry_pending=True  → 等价格回测到 entry 才算入场,期间不判 TP/SL
+    #   entry_pending=False → 已成交(或 immediate 模式),正常跑 TP/SL 监控
+    entry_pending: bool = False
+    entry_filled_at: Optional[int] = None
     tp1_hit_at: Optional[int] = None
     tp1_hit_price: Optional[float] = None
     peak: Optional[float] = None              # high since TP1 (long) / low since TP1 (short)
     closed_at: Optional[int] = None
-    close_reason: Optional[str] = None        # 'sl' | 'tp2' | 'tp1_then_sl' | 'manual'
+    close_reason: Optional[str] = None        # 'sl' | 'tp2' | 'tp1_then_sl' | 'manual' | 'expired_unfilled'
     poi_source: Optional[str] = None          # 用于 SL 后判断是否走 IFVG(只对 4h_fvg)
     poi_low: Optional[float] = None
     poi_high: Optional[float] = None
     tp_target: Optional[float] = None         # 原始 TP,IFVG 二次入场复用
+
+
+# limit 挂单 TTL:未成交超过这个时间则作废(默认 24h)
+_LIMIT_TTL_HOURS = 24
 
 
 class SignalTracker:
@@ -80,6 +89,8 @@ class SignalTracker:
                     trail_mult=float(row.get("trail_mult") or self.default_trail_mult),
                     tp1_portion=float(row.get("tp1_portion") or self.default_tp1_portion),
                     created_at=int(row.get("created_at") or 0),
+                    entry_pending=bool(row.get("entry_pending") or 0),
+                    entry_filled_at=row.get("entry_filled_at"),
                     tp1_hit_at=row.get("tp1_hit_at"),
                     tp1_hit_price=row.get("tp1_hit_price"),
                     peak=row.get("peak"),
@@ -90,13 +101,20 @@ class SignalTracker:
             logger.error(f"SignalTracker.start 加载失败: {e}")
 
     async def add(self, s: Any, atr_4h: float) -> None:
-        """NOTIFIED 信号进入跟踪。"""
+        """NOTIFIED 信号进入跟踪。
+
+        2026-05-24:支持 limit 挂单
+          - entry_mode='limit'(默认):创建时 entry_pending=True,等价格回测到 entry 才算入场
+          - entry_mode='immediate':IFVG 二次入场,立即按 entry 起算 TP/SL
+        """
         entry = getattr(s, "entry_price", None)
         sl = getattr(s, "stop_loss", None)
         tp = getattr(s, "take_profit", None)
         if entry is None or sl is None or tp is None:
             logger.warning(f"Tracker.add 跳过 {getattr(s,'signal_id','?')}: entry/sl/tp 缺失")
             return
+        entry_mode = getattr(s, "entry_mode", "limit")
+        is_pending = (entry_mode == "limit")
         t = Tracker(
             signal_id=s.signal_id,
             symbol=s.symbol,
@@ -108,6 +126,7 @@ class SignalTracker:
             trail_mult=self.default_trail_mult,
             tp1_portion=self.default_tp1_portion,
             created_at=int(time.time()),
+            entry_pending=is_pending,
             poi_source=getattr(s, "poi_source", None),
             poi_low=getattr(s, "poi_low", None),
             poi_high=getattr(s, "poi_high", None),
@@ -115,10 +134,16 @@ class SignalTracker:
         )
         self.trackers[t.signal_id] = t
         await self._persist(t)
-        logger.info(
-            f"Tracker 接管 {t.signal_id[:8]} {t.direction} entry={t.entry:.2f} "
-            f"SL={t.sl:.2f} TP1={t.tp1:.2f} ATR4h={t.atr_4h:.2f}"
-        )
+        if is_pending:
+            logger.info(
+                f"Tracker 挂单等待 {t.signal_id[:8]} {t.direction} limit={t.entry:.2f} "
+                f"SL={t.sl:.2f} TP1={t.tp1:.2f} TTL={_LIMIT_TTL_HOURS}h"
+            )
+        else:
+            logger.info(
+                f"Tracker 接管 {t.signal_id[:8]} {t.direction} entry={t.entry:.2f} "
+                f"SL={t.sl:.2f} TP1={t.tp1:.2f} ATR4h={t.atr_4h:.2f}"
+            )
 
     async def close_manual(self, sid_prefix: str) -> Optional[Tracker]:
         """/close 命令用。按 SID 前缀匹配第一条 open tracker 关闭。"""
@@ -150,7 +175,31 @@ class SignalTracker:
                 logger.error(f"tracker check 失败 {sid[:8]}: {e}")
 
     async def _check_one(self, t: Tracker, hi: float, lo: float, now: int) -> None:
-        """单条 tracker 条件判定。保守:同一根 K 先 SL,再 TP1,最后 trail。"""
+        """单条 tracker 条件判定。保守:同一根 K 先 SL,再 TP1,最后 trail。
+
+        2026-05-24 改造:如果 entry_pending=True,先判 limit 成交,未成交直接返回(不判 TP/SL)。
+        """
+        # ---- limit 挂单未成交 ----
+        if t.entry_pending:
+            # SHORT: 价格上探至 limit_entry → 卖单成交
+            # LONG:  价格下探至 limit_entry → 买单成交
+            filled = False
+            if t.direction == "short" and hi >= t.entry:
+                filled = True
+            elif t.direction == "long" and lo <= t.entry:
+                filled = True
+            if filled:
+                t.entry_pending = False
+                t.entry_filled_at = now
+                await self._persist(t)
+                await self._alert_entry_filled(t)
+                return  # 这根 K 已触发 fill,本根不再判 TP/SL
+            # TTL 检查:超过 _LIMIT_TTL_HOURS 未成交 → 作废
+            if t.created_at and (now - t.created_at) > _LIMIT_TTL_HOURS * 3600:
+                await self._close(t, reason="expired_unfilled", price=t.entry, now=now)
+            return
+
+        # ---- 已入场,跑 SL/TP/Trail 监控 ----
         if t.direction == "long":
             # 1. SL 全仓止损(优先,避免在同根 K 内误报 TP)
             if lo <= t.sl:
@@ -233,6 +282,8 @@ class SignalTracker:
         elif reason == "tp1_then_sl":
             await self._alert_sl(t, price, after_tp1=True)
             asyncio.create_task(self._auto_postmortem(t, "tp1_then_sl"))
+        elif reason == "expired_unfilled":
+            await self._alert_limit_expired(t)
 
     def _compute_pnl_r(self, t: Tracker, exit_price: float, reason: str) -> Optional[float]:
         """以 entry→SL 距离为 1 R,算总 PnL。仓位单位化:tp1_portion + (1-tp1_portion)。"""
@@ -428,6 +479,24 @@ class SignalTracker:
             f"⛔ {tag} [{t.signal_id[:8]}]\n"
             f"{t.direction.upper()} entry={t.entry:.2f} SL={t.sl:.2f}\n"
             f"→ {'剩余' if after_tp1 else '全仓'}已止损"
+        )
+        await self._notify(body)
+
+    async def _alert_entry_filled(self, t: Tracker) -> None:
+        """limit 挂单成交通知:tracker 从此切到 SL/TP 监控。"""
+        body = (
+            f"✅ Limit 已成交 [{t.signal_id[:8]}]\n"
+            f"{t.direction.upper()} entry={t.entry:.2f} SL={t.sl:.2f} TP1={t.tp1:.2f}\n"
+            f"→ Tracker 开始监控 SL / TP1 / TP2-trail"
+        )
+        await self._notify(body)
+
+    async def _alert_limit_expired(self, t: Tracker) -> None:
+        """limit 挂单 TTL 超时未成交。"""
+        body = (
+            f"⏱️ Limit 挂单超时 [{t.signal_id[:8]}]\n"
+            f"{t.direction.upper()} limit={t.entry:.2f}\n"
+            f"→ {_LIMIT_TTL_HOURS}h 内价格未回测,信号作废"
         )
         await self._notify(body)
 

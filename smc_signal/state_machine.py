@@ -75,6 +75,10 @@ class SignalState:
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
     risk_reward: Optional[float] = None
+    # 2026-05-24:入场模式
+    #   "limit"     - 标准 STEP6 信号,entry_price 是挂单价(POI 边界外侧),tracker 等价格回测才成交
+    #   "immediate" - IFVG 二次入场 / 回退路径,tracker 立即按 entry_price 接管
+    entry_mode: str = "limit"
     scores: dict = field(default_factory=dict)
     total_score: float = 0.0
     created_at: int = field(default_factory=lambda: int(time.time()))
@@ -1423,6 +1427,7 @@ class SignalEngine:
                     stop_loss=new_sl,
                     take_profit=tp_target,
                     risk_reward=rr,
+                    entry_mode="immediate",  # IFVG 是回踩成交即入场,不走 limit 等待
                     total_score=3.0,  # 4h_fvg_ifvg 给 Tier A 等价权重
                     scores={"C_POI": 3.0, "C_Vol": 0.0, "C_Delta": 0.0,
                             "C_Override": 0.0, "C_Confluence": 0.0, "C_Fib": 0.0},
@@ -1531,43 +1536,74 @@ class SignalEngine:
                 #  都在 1% 以内 → 过滤器不触发;反而把 04-12 +2.23R 赢家杀掉了。
                 #  真正的问题不是入场距离,而是下跌趋势中的 POI 反转失败,另寻他法。)
 
-                # Step6:自动计算 SL(选项 B:15m swing 外侧)+ TP(反向 liquidity / POI)
+                # Step6:limit 挂单入场(2026-05-24 改造)
+                #   SHORT: limit_entry = POI_low - buffer,  SL = POI_high + buffer
+                #   LONG:  limit_entry = POI_high + buffer, SL = POI_low - buffer
+                #   buffer = 0.15 × ATR_4h
+                # 等价于"在 POI 外侧 buffer 距离挂单等待回测",SL 在 POI 整体外侧
+                # 保护,不被 POI 内部针刺扫掉。POI 缺失时回退到旧 swing-based SL +
+                # 立即入场。
                 atr_4h = self._atr(symbol, "4h")
                 atr_1h = self._atr(symbol, "1h")
                 candles_4h = self.candles.window(symbol, "4h", 80)
                 candles_1h = self.candles.window(symbol, "1h", 100)
                 vp_snap = self._vp_provider() if self._vp_provider else None
 
-                sl = self._calculate_sl(s.direction, candles_15m, price, atr_4h, atr_1h)
-                if sl is None:
-                    self._diag["step6_fail_no_sl"] += 1
-                    self._invalidate(sid, s, "无法定位 15m swing 作为 SL")
-                    continue
+                buffer = self._SL_BUFFER_ATR_MULT * atr_4h if atr_4h > 0 else 0.0
+                use_limit = (
+                    s.poi_low is not None and s.poi_high is not None
+                    and buffer > 0 and s.poi_high > s.poi_low
+                )
+                if use_limit:
+                    if s.direction == "short":
+                        entry_target = float(s.poi_low) - buffer
+                        sl = float(s.poi_high) + buffer
+                    else:  # long
+                        entry_target = float(s.poi_high) + buffer
+                        sl = float(s.poi_low) - buffer
+                    entry_mode = "limit"
+                    self._diag["step6_limit_entry"] += 1
+                else:
+                    # 回退:POI 边界缺失 / ATR 异常 → 沿用旧 swing-based SL + 立即入场
+                    sl = self._calculate_sl(s.direction, candles_15m, price, atr_4h, atr_1h)
+                    if sl is None:
+                        self._diag["step6_fail_no_sl"] += 1
+                        self._invalidate(sid, s, "无法定位 SL(POI 缺失且 swing 计算失败)")
+                        continue
+                    entry_target = price
+                    entry_mode = "immediate"
+                    self._diag["step6_fallback_swing"] += 1
+
                 # SL 方向合理性
-                if (s.direction == "long" and sl >= price) or (s.direction == "short" and sl <= price):
+                if (s.direction == "long" and sl >= entry_target) or \
+                   (s.direction == "short" and sl <= entry_target):
                     self._diag["step6_fail_sl_wrong_side"] += 1
-                    self._invalidate(sid, s, f"SL {sl:.2f} 与 entry {price:.2f} 方向冲突")
+                    self._invalidate(
+                        sid, s,
+                        f"SL {sl:.2f} 与 entry {entry_target:.2f} 方向冲突"
+                    )
                     continue
 
-                risk = abs(price - sl)
+                risk = abs(entry_target - sl)
                 tp_result = self._calculate_tp(
-                    s.direction, price, candles_1h, candles_4h, atr_1h, atr_4h, vp_snap,
+                    s.direction, entry_target, candles_1h, candles_4h, atr_1h, atr_4h, vp_snap,
                     min_reward=2.0 * risk,   # 偏好 ≥2R 的候选,避开 range 内紧贴的 swing
                 )
                 if tp_result is None:
                     # 无结构 TP:用固定 2R 兜底(方便用户手动替换,也让低质量品种仍可出信号)
-                    tp = price + self._TP_FALLBACK_RR * risk if s.direction == "long" \
-                        else price - self._TP_FALLBACK_RR * risk
+                    tp = entry_target + self._TP_FALLBACK_RR * risk if s.direction == "long" \
+                        else entry_target - self._TP_FALLBACK_RR * risk
                     tp_src = "fallback_2R"
                 else:
                     tp, tp_src = tp_result
-                    if (s.direction == "long" and tp <= price) or (s.direction == "short" and tp >= price):
+                    if (s.direction == "long" and tp <= entry_target) or \
+                       (s.direction == "short" and tp >= entry_target):
                         # 候选方向反了(理论上不会,但防御一下),回退 2R
-                        tp = price + self._TP_FALLBACK_RR * risk if s.direction == "long" \
-                            else price - self._TP_FALLBACK_RR * risk
+                        tp = entry_target + self._TP_FALLBACK_RR * risk if s.direction == "long" \
+                            else entry_target - self._TP_FALLBACK_RR * risk
                         tp_src = "fallback_2R"
 
-                reward = abs(tp - price)
+                reward = abs(tp - entry_target)
                 rr = reward / risk if risk > 0 else 0.0
 
                 # ⭐ 结构 TP 硬闸:如果结构给出的 TP 距离 < 1.5R,说明价格在范围顶/底,
@@ -1579,23 +1615,25 @@ class SignalEngine:
                     self._invalidate(
                         sid, s,
                         f"结构 TP 过近(R:R={rr:.2f} < {MIN_STRUCTURAL_RR}):价格可能在范围顶/底,"
-                        f"entry={price:.2f} SL={sl:.2f} TP={tp:.2f}({tp_src})"
+                        f"entry={entry_target:.2f} SL={sl:.2f} TP={tp:.2f}({tp_src})"
                     )
                     continue
                 # R:R 只作参考展示,不做硬性 gate(用户明确:通知里给出 R:R 让交易员自己判断)
                 if rr < self.rr_min:
                     self._diag["step6_rr_below_min_warn"] += 1
 
-                s.entry_price = price
+                s.entry_price = float(entry_target)
                 s.stop_loss = float(sl)
                 s.take_profit = float(tp)
                 s.risk_reward = float(rr)
+                s.entry_mode = entry_mode
                 s.step = SignalStep.STEP6_PASSED
                 s.updated_at = self._now()
                 self._diag["step6_passed"] += 1
                 logger.info(
-                    f"[SIGNAL {sid[:8]}] STEP6 entry={price:.4f} "
-                    f"SL={sl:.4f} TP={tp:.4f}({tp_src}) R:R={rr:.2f}"
+                    f"[SIGNAL {sid[:8]}] STEP6 mode={entry_mode} "
+                    f"entry={entry_target:.4f} SL={sl:.4f} TP={tp:.4f}({tp_src}) R:R={rr:.2f} "
+                    f"(POI=[{s.poi_low}, {s.poi_high}], buffer={buffer:.2f}, 15m_close={price:.2f})"
                 )
 
             if s.step == SignalStep.STEP6_PASSED:
