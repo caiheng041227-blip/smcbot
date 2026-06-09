@@ -393,6 +393,10 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
 
     engine = SignalEngine(candle_manager=candles, key_levels=levels, scorer=signal_score, config=cfg)
     engine.set_vp_provider(lambda: weekly_vp.current())
+
+    # ICT engine 并行(共享 candles,独立 state)
+    from ict_signal import ICTSignalEngine
+    ict_engine = ICTSignalEngine(candle_manager=candles, scorer=signal_score, config=cfg)
     if ref_symbol:
         swing_lb = int(cfg.get("signal", {}).get("swing_lookback", 5))
         def _cg(direction):
@@ -455,6 +459,8 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
             # 推进前快照:(sid -> step)
             pre_state = {sid: s.step.value for sid, s in engine.active_signals.items()}
             await engine.on_candle_close(sym, tf, candles.last(sym, tf))
+            # 同步推进 ICT engine(db=None,iFVG 自动跳过;OB/OTE/Raid/MSS 正常触发)
+            await ict_engine.on_candle_close(sym, tf, candles.last(sym, tf), db=None)
             # 推进后对比:记录所有变化
             for sid, s in engine.active_signals.items():
                 new_step = s.step.value
@@ -558,6 +564,45 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
                     "_features": _enrich_signal(s, engine, symbol, close_time),
                 })
 
+    # ----- 收割 ICT engine 的 SCORED 信号 -----
+    from smc_signal.state_machine import SignalStep as _SS
+    ict_collected = 0
+    for sid, s in list(ict_engine.active_signals.items()):
+        if s.step != _SS.SCORED:
+            continue
+        # 这些 setup 已经在 _emit_setup 里 dedup 过,直接接受
+        collected_signals.append({
+            "time": int((s.created_at or 0) * 1000),  # ms 给 simulate_outcome 用
+            "level": s.triggered_level,
+            "direction": s.direction,
+            "entry": s.entry_price,
+            "sl": s.stop_loss,
+            "tp": s.take_profit,
+            "rr": s.risk_reward,
+            "score": s.total_score,
+            "poi": s.poi_type,
+            "source": s.poi_source,
+            "source_engine": "ict",
+            "poi_low": s.poi_low,
+            "poi_high": s.poi_high,
+            "entry_mode": getattr(s, "entry_mode", "immediate"),
+            "notified": True,
+            "scores": dict(s.scores or {}),
+            "_features": {
+                "time_ms": int((s.created_at or 0) * 1000),
+                "direction": s.direction,
+                "poi_source": s.poi_source,
+                "poi_type": s.poi_type,
+                "entry": s.entry_price,
+                "sl": s.stop_loss,
+                "tp": s.take_profit,
+                "rr": s.risk_reward,
+                "score_total": s.total_score,
+            },
+        })
+        ict_collected += 1
+    logger.info(f"[ICT] engine 收割 {ict_collected} 条 SCORED 信号(诊断: {dict(ict_engine.diagnostics())})")
+
     logger.info(f"回放完成,捕获通知级信号 {len(collected_signals)} 条")
     logger.info(f"步骤漏斗: {step_counts}")
     # 详细 gate 诊断
@@ -619,6 +664,7 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
         if tp_sim is None and sl_sim is not None and sig["entry"] is not None:
             r = abs(sig["entry"] - sl_sim)
             tp_sim = sig["entry"] + 2 * r if sig["direction"] == "long" else sig["entry"] - 2 * r
+        # 统一用 simulate_outcome(SMC 和 ICT 都走固定 TP/SL,SignalTracker hybrid trail 接管)
         out = simulate_outcome(
             sig["time"], sig["direction"], sig["entry"], sl_sim, tp_sim, future_1h,
             max_hours=168,
@@ -642,86 +688,11 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
             merged["hybrid_fill_bars"] = hy.get("fill_bars")
         results.append(merged)
 
-    # === IFVG 二次入场模拟(对 NOTIFIED 4h_fvg + outcome=sl 的信号,反向触发)===
-    # 复用 scripts/ifvg_analysis.simulate_ifvg_reentry,逻辑同生产 state_machine.check_ifvg_reentry
-    from scripts.ifvg_analysis import simulate_ifvg_reentry
     ny = pytz.timezone("America/New_York")
-    ifvg_added = 0
-    for r in list(results):
-        if r.get("source") != "4h_fvg" or not r.get("notified") or r.get("outcome") != "sl":
-            continue
-        poi_low = r.get("poi_low")
-        poi_high = r.get("poi_high")
-        if poi_low is None or poi_high is None:
-            continue
-        # SL 命中时刻 ≈ sig_time + bars × 1h(future_bars 里的 bar 是 1h)
-        bars_to_sl = r.get("bars") or 0
-        sl_hit_time_ms = int(r["time"]) + int(bars_to_sl) * 3600 * 1000
-        ifvg = simulate_ifvg_reentry(
-            sl_hit_time_ms=sl_hit_time_ms,
-            direction=r["direction"],
-            poi_low=float(poi_low),
-            poi_high=float(poi_high),
-            original_tp=r["tp"],
-            future_bars=future_1h,
-            max_hours=24,
-            sl_buffer_pct=0.5,
-        )
-        if not ifvg.get("reentered"):
-            continue
-        ifvg_features = dict(r.get("_features") or {})
-        ifvg_features.update({
-            "time_ms": ifvg["entry_time_ms"],
-            "time_iso": datetime.fromtimestamp(
-                ifvg["entry_time_ms"] / 1000.0, tz=timezone.utc
-            ).astimezone(ny).strftime("%Y-%m-%d %H:%M:%S"),
-            "direction": r["direction"],
-            "poi_source": "4h_fvg_ifvg",
-            "poi_type": "bearish_fvg_ifvg" if r["direction"] == "short" else "bullish_fvg_ifvg",
-            "entry": ifvg["entry"],
-            "sl": ifvg["sl"],
-            "tp": ifvg["tp"],
-            "rr": ifvg["rr"],
-            "score_total": 3.0,
-        })
-        ifvg_rec = {
-            "time": ifvg["entry_time_ms"],
-            "level": "POI_high" if r["direction"] == "short" else "POI_low",
-            "direction": r["direction"],
-            "entry": ifvg["entry"],
-            "sl": ifvg["sl"],
-            "tp": ifvg["tp"],
-            "rr": ifvg["rr"],
-            "score": 3.0,
-            "poi": "bearish_fvg_ifvg" if r["direction"] == "short" else "bullish_fvg_ifvg",
-            "source": "4h_fvg_ifvg",
-            "poi_low": poi_low,
-            "poi_high": poi_high,
-            "notified": True,
-            "scores": {"C_POI": 3.0},
-            "_features": ifvg_features,
-            "outcome": ifvg["outcome"],
-            "pnl_r": ifvg["pnl_r"],
-            "bars": ifvg.get("wait_bars"),
-        }
-        if trail_atr_mult > 0:
-            atr_4h_at_sig = float(ifvg_features.get("atr_4h") or 0.0)
-            future_after = [b for b in future_1h if int(b["t"]) > ifvg["entry_time_ms"]]
-            hy = simulate_outcome_hybrid(
-                ifvg["entry_time_ms"], r["direction"], ifvg["entry"], ifvg["sl"], ifvg["tp"],
-                atr_4h_at_sig, future_after, max_hours=168,
-                tp1_portion=tp1_portion, trail_atr_mult=trail_atr_mult,
-                entry_mode="immediate",  # IFVG 二次入场是回踩即成交,不走 limit 等待
-            )
-            ifvg_rec["hybrid_outcome"] = hy.get("outcome")
-            ifvg_rec["hybrid_pnl_r"] = hy.get("pnl_r")
-            ifvg_rec["hybrid_tp1_hit"] = hy.get("tp1_hit")
-        results.append(ifvg_rec)
-        ifvg_added += 1
-    if ifvg_added:
-        logger.info(f"[IFVG] 模拟 {ifvg_added} 条 4h_fvg_ifvg 二次入场信号")
-    else:
-        logger.info("[IFVG] 未触发任何 4h_fvg_ifvg 二次入场")
+
+    # SMC 信号默认 source_engine=smc
+    for rec in results:
+        rec.setdefault("source_engine", "smc")
 
     # 打印表格
     print(f"\n{'='*100}")
@@ -781,6 +752,22 @@ async def run_backtest(symbol: str, ref_symbol: Optional[str], days: int, cfg: d
     print("-" * 100)
     print(f"信号: {len(results)}  已闭合: {len(closed)}  胜: {len(wins)}  "
           f"胜率: {(len(wins)/max(1,len(closed))):.1%}  累计 R: {total_r:+.2f}")
+
+    # 按 source_engine 分组(SMC vs ICT)
+    by_engine = defaultdict(list)
+    for r in results:
+        by_engine[r.get("source_engine") or "smc"].append(r)
+    if len(by_engine) > 1 or "ict" in by_engine:
+        print("-" * 100)
+        for eng in ("smc", "ict"):
+            rs = by_engine.get(eng) or []
+            if not rs:
+                continue
+            cs = [r for r in rs if r["outcome"] in ("tp", "sl")]
+            ws = [r for r in cs if r["outcome"] == "tp"]
+            tr = sum(r["pnl_r"] for r in cs)
+            print(f"  [{eng.upper():>3}]  信号: {len(rs):3d}  闭合: {len(cs):3d}  胜: {len(ws):2d}  "
+                  f"胜率: {(len(ws)/max(1,len(cs))):>5.1%}  ΣR: {tr:+.2f}")
 
     # Hybrid trail 对比汇总
     if trail_atr_mult > 0:

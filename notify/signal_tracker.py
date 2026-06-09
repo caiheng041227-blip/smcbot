@@ -42,7 +42,7 @@ class Tracker:
     tp1_hit_price: Optional[float] = None
     peak: Optional[float] = None              # high since TP1 (long) / low since TP1 (short)
     closed_at: Optional[int] = None
-    close_reason: Optional[str] = None        # 'sl' | 'tp2' | 'tp1_then_sl' | 'manual' | 'expired_unfilled'
+    close_reason: Optional[str] = None        # 'sl' | 'tp2' | 'tp1_then_sl' | 'manual' | 'expired_unfilled' | 'htf_choch' | 'tp'
     poi_source: Optional[str] = None          # 用于 SL 后判断是否走 IFVG(只对 4h_fvg)
     poi_low: Optional[float] = None
     poi_high: Optional[float] = None
@@ -63,12 +63,16 @@ class SignalTracker:
         symbol: Optional[str] = None,
         trail_mult: float = 1.5,
         tp1_portion: float = 0.5,
+        ict_engine_enabled: bool = False,
     ) -> None:
         self.db = db
         self.notifier = notifier
         self.symbol = symbol
         self.default_trail_mult = trail_mult
         self.default_tp1_portion = tp1_portion
+        # 注:ict_engine_enabled = 是否运行 ICT engine 并接收其 iFVG 信号。
+        # 决定 SL 时是否 register failed_poi 给 ICT engine 消费。
+        self.ict_engine_enabled = ict_engine_enabled
         self.trackers: Dict[str, Tracker] = {}
 
     async def start(self) -> None:
@@ -256,8 +260,9 @@ class SignalTracker:
                 await self.db.update_signal_outcome(t.signal_id, reason, pnl_r)
             except Exception as e:  # noqa: BLE001
                 logger.error(f"回写 signals.outcome 失败 {t.signal_id[:8]}: {e}")
-        # IFVG 注册:SL'd 4h_fvg 信号 → 写 failed_pois,等价格回踩做二次入场
-        if reason in ("sl", "tp1_then_sl") and t.poi_source == "4h_fvg" and self.db is not None:
+        # iFVG 注册(ICT reversed):SMC 4h_fvg 信号 SL → 写 failed_pois,供 ICT engine 反向入场
+        # 只在 ICT engine 启用时注册(避免无人消费的 DB 写)
+        if self.ict_engine_enabled and reason in ("sl", "tp1_then_sl") and t.poi_source == "4h_fvg" and self.db is not None:
             if t.poi_low is not None and t.poi_high is not None and t.tp_target is not None:
                 try:
                     await self.db.register_failed_poi(

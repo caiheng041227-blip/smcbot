@@ -35,6 +35,7 @@ from notify import TelegramNotifier
 from notify.signal_tracker import SignalTracker
 from smc_signal import SignalEngine, score as signal_score
 from smc_signal.state_machine import SignalStep
+from ict_signal import ICTSignalEngine
 from storage.database import Database
 from utils.logger import logger, setup_logger
 
@@ -193,7 +194,7 @@ async def main_async() -> None:
     db = Database(str(db_path))
     await db.connect()
 
-    # 信号引擎
+    # SMC 信号引擎(原有)
     engine = SignalEngine(
         candle_manager=candles,
         key_levels=levels,
@@ -201,6 +202,17 @@ async def main_async() -> None:
         config=cfg,
     )
     engine.set_vp_provider(lambda: vp_session.current())
+
+    # ICT 信号引擎(独立 pipeline,默认 OFF;通过 config.ict.engine_enabled 启用)
+    ict_engine: Optional[ICTSignalEngine] = ICTSignalEngine(
+        candle_manager=candles,
+        scorer=signal_score,
+        config=cfg,
+    )
+    if ict_engine.engine_enabled:
+        logger.info("ICT engine 已启用")
+    else:
+        logger.info("ICT engine 已加载但未启用(config.ict.engine_enabled=false)")
 
     # BTC 联动过滤:参考品种结构与 ETH 方向冲突 → 否决 Step1
     ref_cfg = cfg.get("reference") or {}
@@ -226,8 +238,11 @@ async def main_async() -> None:
     notifier: Optional[TelegramNotifier] = None
 
     # Signal tracker(advisory TP1/TP2/SL 监视,不下单)
+    ict_cfg = cfg.get("ict") or {}
+    ict_engine_on = bool(ict_cfg.get("engine_enabled", False))
     tracker = SignalTracker(db=db, notifier=None, symbol=symbol,
-                            trail_mult=1.5, tp1_portion=0.5)
+                            trail_mult=1.5, tp1_portion=0.5,
+                            ict_engine_enabled=ict_engine_on)
     await tracker.start()
 
     if tg_token and tg_chat:
@@ -263,13 +278,14 @@ async def main_async() -> None:
                              c.open, c.high, c.low, c.close, c.volume)
         )
         if is_main:
+            # SMC engine 推进
             asyncio.create_task(engine.on_candle_close(sym, tf, c))
+            # ICT engine 推进(独立 pipeline,见 ict_signal/state_machine.py)
+            if ict_engine is not None:
+                asyncio.create_task(ict_engine.on_candle_close(sym, tf, c, db))
             # 仓位追踪:在 15m 收盘扫描所有 open tracker 的 TP1/SL/Trail 条件
             if tf == "15m":
                 asyncio.create_task(tracker.on_candle(sym, c))
-            # IFVG 二次入场:1h 收盘时扫 failed_pois 看是否回踩
-            if tf == "1h":
-                asyncio.create_task(engine.check_ifvg_reentry(sym, c, db))
 
     # REST 回填 + 状态回放:在订阅 close 回调之前灌入历史数据,并用近 N 小时
     # 的 K 线重放驱动 state_machine,恢复 active_signals(Step1/2/3/5 in-flight)。
@@ -384,35 +400,39 @@ async def main_async() -> None:
 
     async def notify_loop():
         from smc_signal.state_machine import SignalStep as _SS
+
+        async def _process_engine_signals(eng, eng_name: str):
+            """处理单个 engine 的 SCORED 信号:落盘 + 推送 + tracker.add。"""
+            # 1. 先把所有 SCORED 信号(无论是否过 threshold)落盘 → /signals 命令能查到
+            for sid, s in list(eng.active_signals.items()):
+                if s.step == _SS.SCORED and not getattr(s, "scored_persisted", False):
+                    try:
+                        await db.upsert_signal_scored(s)
+                        s.scored_persisted = True
+                    except Exception as e:  # noqa: BLE001
+                        logger.error(f"[{eng_name}] 落盘 SCORED 信号失败 {sid[:8]}: {e}")
+            # 2. 推送过 threshold 的信号
+            for s in eng.get_notification_ready():
+                logger.success(
+                    f"[{eng_name} READY] {s.symbol} {s.direction} "
+                    f"entry={s.entry_price} SL={s.stop_loss} TP={s.take_profit} "
+                    f"RR={s.risk_reward:.2f} score={s.total_score}"
+                )
+                await db.insert_signal(s)
+                gbrain_log_signal(s, source="live")
+                if notifier:
+                    await notifier.send_signal(s, with_actions=False)
+                try:
+                    atr_4h = eng._atr(s.symbol, "4h")
+                    await tracker.add(s, atr_4h)
+                except Exception as e:  # noqa: BLE001
+                    logger.error(f"[{eng_name}] tracker.add 失败 {s.signal_id[:8]}: {e}")
+
         while True:
             try:
-                # 1. 先把所有 SCORED 信号(无论是否过 threshold)落盘 → /signals 命令能查到
-                for sid, s in list(engine.active_signals.items()):
-                    if s.step == _SS.SCORED and not getattr(s, "scored_persisted", False):
-                        try:
-                            await db.upsert_signal_scored(s)
-                            s.scored_persisted = True
-                        except Exception as e:  # noqa: BLE001
-                            logger.error(f"落盘 SCORED 信号失败 {sid[:8]}: {e}")
-                # 2. 推送过 threshold 的信号
-                for s in engine.get_notification_ready():
-                    logger.success(
-                        f"[SIGNAL READY] {s.symbol} {s.direction} "
-                        f"entry={s.entry_price} SL={s.stop_loss} TP={s.take_profit} "
-                        f"RR={s.risk_reward:.2f} score={s.total_score}"
-                    )
-                    # 先落盘(补 notified_at),再发通知
-                    await db.insert_signal(s)
-                    # GBrain 旁路记录(sync, 永不 raise, 失败只 warn)
-                    gbrain_log_signal(s, source="live")
-                    if notifier:
-                        await notifier.send_signal(s, with_actions=False)
-                    # 注册到 tracker:监视 TP1 / TP2-trail / SL
-                    try:
-                        atr_4h = engine._atr(s.symbol, "4h")
-                        await tracker.add(s, atr_4h)
-                    except Exception as e:  # noqa: BLE001
-                        logger.error(f"tracker.add 失败 {s.signal_id[:8]}: {e}")
+                await _process_engine_signals(engine, "SMC")
+                if ict_engine is not None and ict_engine.engine_enabled:
+                    await _process_engine_signals(ict_engine, "ICT")
             except Exception as e:
                 logger.error(f"notify_loop 异常: {e}")
             await asyncio.sleep(5)

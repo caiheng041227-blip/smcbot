@@ -57,3 +57,43 @@ signal:
   poi_break_pct: 0.01         # C: 收盘价穿透 POI 边界阈值(与 0.5×ATR_4h 取大)
   sweep_wick_body_ratio: 1.5  # 扫荡事件长影线阈值(原 2.0 放宽)
 
+# ============================================================
+# ICT (Inner Circle Trader) Engine — 与 SMC 并行的独立 pipeline
+# ============================================================
+# 架构:ict_signal/ 是独立 engine,默认 OFF。开启后与 SMC engine 同时跑,
+# 各自生成信号,共用 SignalTracker。
+# Phase A 内含:HTF gates(daily bias + premium/discount)+ iFVG 反向二次入场。
+# Phase B 计划:结构 SL trail (LH/HL) + HTF CHoCH 退出 + BOS 确认。
+ict:
+  # 主开关:engine_enabled=false 时 ICT engine 装载但所有 on_candle_close 立即 return
+  engine_enabled: false
+
+  # 4 种 ICT POI 类型独立开关(每种可单独 toggle):
+  pois:
+    ob: true                       # ICT OB at premium/discount(187d:5 闭合 / 60% WR / +9R)
+    ote: true                      # OTE 62-79% retracement(187d:50 闭合 / 48% WR / +31R)— 主力
+    liquidity_raid: true           # 流动性扫荡反转(187d:0 触发 — 1h 级别条件稀少)
+    mss_retest: false              # 4h MSS retest(2 步状态机机制对,但 187d -35R,setup 在此市场不行)
+
+  # iFVG reversed 入场参数(消费 SMC 4h_fvg SL'd POI)
+  ifvg_rr_min: 1.0                 # RR 最低门槛(老门槛 1.5 太严,sl_hit_extreme 作 TP 常达不到)
+
+  # HTF gates 之 ① Daily MSS bias
+  daily_bias_enabled: true         # 违反 daily bias 方向的 ICT 信号被否决
+  daily_bias_lookback: 30          # ATR pivot 在 D1 上找 swing 的窗口(根)
+  daily_bias_min_move_mult: 0.5    # ATR pivot 最小波动倍数(0.5 捕捉到 5-7 这种内部 MSS)
+
+  # HTF gates 之 ② Premium/Discount zone
+  premium_discount_enabled: true   # premium zone 拒 long,discount zone 拒 short
+  dealing_range_lookback: 60       # 4h dealing range 窗口(根)
+  dealing_range_min_move_mult: 2.0 # 4h ATR pivot 最小波动倍数(只识别大波动)
+  premium_threshold: 0.55          # >=55% 分位 = premium → veto long
+  discount_threshold: 0.45         # <=45% 分位 = discount → veto short
+
+  # HTF gates 之 ③ 4h MSS bias —— daily 滞后时的早期预警
+  # 测试结论(2026-06-09 30d):救 5-7 那 2 单 long 但误杀 4 个 short winners,
+  # ΣR 从 +13.68R 跌到 +7.82R。daily 滞后的代价比 4h gate 误杀小。默认 OFF。
+  h4_bias_enabled: false
+  h4_bias_lookback: 60             # 4h ATR pivot 窗口(根)
+  h4_bias_min_move_mult: 0.5       # 0.5 = 灵敏,但太敏感误拦反弹中的 short
+
