@@ -1,16 +1,12 @@
-"""ICT (Inner Circle Trader) 信号引擎。
+"""ICT (Inner Circle Trader) 信号引擎 —— 项目唯一信号 pipeline。
 
-与 smc_signal 完全独立的 pipeline:
-  - 自己的状态机(ICTSignalEngine)
-  - 自己的入场逻辑(iFVG reversed,后续扩 OTE / OB)
-  - 自己的 HTF gates(daily bias + premium/discount)
-  - 自己的诊断计数
+(SMC 管线已于 2026-06-10 删除:365d ΣR -16.9 / 730d -146.8,全 POI source 两年为负。)
 
-由 main.py 与 SMC engine **并行**驱动 ——
-每根 K 线 close 时,两个 engine 各自跑一遍,各自发信号到 SignalTracker。
-
-Tracker / TG / DB 用 source_engine 字段区分 SMC vs ICT 信号。
+  - 状态机:ICTSignalEngine(4h/1h close 驱动,4 POI 检测器 + HTF gates)
+  - 数据结构:SignalState / SignalStep(原 smc_signal 迁入,DB/TG/tracker 共用)
+  - 信号经 SignalTracker 跟踪 TP1/SL/trail,经 TelegramNotifier 推送
 """
+from ict_signal.signal_state import SignalState, SignalStep
 from ict_signal.state_machine import ICTSignalEngine
 
-__all__ = ["ICTSignalEngine"]
+__all__ = ["ICTSignalEngine", "SignalState", "SignalStep"]

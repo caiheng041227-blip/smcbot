@@ -1,25 +1,19 @@
-# SMC/ICT 数据采集层配置
+# ICT 交易信号 Bot 配置(SMC 管线 2026-06-10 删除:365d -16.9R / 730d -146.8R 全负)
 exchange: okx                   # binance / okx。okx 不受 geo 限制,Lightsail/美东部署用它
-symbol: ETHUSDT                 # Binance USDT 永续
+symbol: ETHUSDT                 # USDT 永续
 timeframes:                     # 需要订阅的 K 线周期
   - 1m                          # 仅用于聚合实时数据；不驱动状态机
-  - 15m                         # Step5 CHoCH 确认、Step6 入场
-  - 1h                          # Step2+3(扫荡事件)、Step4 POI
-  - 4h                          # Step1 方向共识 + 结构反转检查
-  - 1d                          # Step1 方向共识参考
+  - 15m                         # SignalTracker TP1/SL/trail 扫描粒度
+  - 1h                          # ICT:liquidity_raid 扫描 + pending MSS retest 检查
+  - 4h                          # ICT:OB / OTE 扫描 + dealing range
+  - 1d                          # ICT:daily bias gate
 
 timezone: America/New_York      # 交易日分界时区
 daily_reset_hour: 17            # 17:00 ET = CME 收盘，作为"昨日/今日"分界
 
 volume_profile:
-  buckets: 200                  # VP 价格分档数（可调）
-  value_area_pct: 0.70          # VA 覆盖比例（SMC/ICT 标准 70%）
-
-# 相关性参考品种:Step1 方向共识要求 BTC 不与 ETH 冲突。
-# BTC 崩盘时 ETH 的 SMC 结构通常会失效,这个过滤能避开大部分"反转失败"场景。
-reference:
-  symbol: BTCUSDT
-  timeframe: 4h        # 只订阅这一根 kline 够用,不要额外订阅浪费连接
+  buckets: 200                  # VP 价格分档数(现仅用于日志观测 + daily_vp 落盘)
+  value_area_pct: 0.70          # VA 覆盖比例
 
 binance:
   ws_base: wss://fstream.binance.com
@@ -32,9 +26,8 @@ binance:
 storage:
   db_path: data/market.db
 
-# 重启后回放:用近 N 小时 K 线驱动 state_machine,恢复 active_signals。
+# 重启后回放:用近 N 小时 K 线驱动 ICT engine,恢复 active_signals。
 # 0 = 禁用(仅做数据回填,state 从空开始,每次部署丢失进行中信号)
-# 24 = 回放近 24h(推荐:覆盖 Step1 36h TTL 的大部分场景)
 replay_hours: 24
 
 # 心跳通知:每 N 小时主动 TG 推一条 bot 状态(0 = 关闭)
@@ -45,38 +38,28 @@ logging:
   level: INFO
 
 signal:
-  swing_lookback: 5
-  ob_lookback: 120              # 在最近 120 根 4h (≈20 天) 内搜索 OB 候选
-  choch_confirm: close        # 只用收盘价确认 BOS/CHoCH，避免影线假突破
-  score_threshold: 3.0           # 2026-04-20 scorer 重构后(满分 5),阈值 3 = POI 良好 tier + ≥1 个证据
-  signal_ttl_seconds: 129600  # 36h:Step1 TTL(Step2+ 不受时间限制)
-  risk_reward_min: 2.0        # 已弃用(TP 由用户手动决定)
-  level_proximity_pct: 0.005  # 0.5%:Step2 已降级为参考,主要判定改为"K 线影线触碰"
-  # 场景失效阈值(除时间 TTL 外的前提性判定)
-  # price_drift_pct: 已删除 —— 漂移不是有效的失效信号,误杀太多
-  poi_break_pct: 0.01         # C: 收盘价穿透 POI 边界阈值(与 0.5×ATR_4h 取大)
-  sweep_wick_body_ratio: 1.5  # 扫荡事件长影线阈值(原 2.0 放宽)
+  signal_ttl_seconds: 129600  # 36h:信号 TTL(ICT engine 读取;limit 单未成交过期)
 
 # ============================================================
-# ICT (Inner Circle Trader) Engine — 与 SMC 并行的独立 pipeline
+# ICT (Inner Circle Trader) Engine — 项目唯一信号 pipeline
 # ============================================================
-# 架构:ict_signal/ 是独立 engine,默认 OFF。开启后与 SMC engine 同时跑,
-# 各自生成信号,共用 SignalTracker。
-# Phase A 内含:HTF gates(daily bias + premium/discount)+ iFVG 反向二次入场。
-# Phase B 计划:结构 SL trail (LH/HL) + HTF CHoCH 退出 + BOS 确认。
+# 回测基准(2026-06-10,教科书确认 gate + displacement 0.0):
+#   365d:150-168 信号 / ~37% WR / ΣR +37 ~ +40
+#   730d:301 信号 / 33.8% WR / ΣR +22.5(前一年 -20 后一年 +43,regime 依赖见 gbrain)
 ict:
   # 主开关:engine_enabled=false 时 ICT engine 装载但所有 on_candle_close 立即 return
-  engine_enabled: false
+  # 2026-06-10:SMC 删除后 ICT 是唯一信号源 —— false = bot 只剩心跳/数据采集,不推任何信号
+  engine_enabled: true
 
   # 4 种 ICT POI 类型独立开关(每种可单独 toggle):
   pois:
-    ob: true                       # ICT OB at premium/discount(187d:5 闭合 / 60% WR / +9R)
-    ote: true                      # OTE 62-79% retracement(187d:50 闭合 / 48% WR / +31R)— 主力
-    liquidity_raid: true           # 流动性扫荡反转(187d:0 触发 — 1h 级别条件稀少)
-    mss_retest: false              # 4h MSS retest(2 步状态机机制对,但 187d -35R,setup 在此市场不行)
+    ob: true                       # ICT OB at premium/discount(365d:45 信号 / +7.05R)
+    ote: true                      # OTE 62-79% retracement(365d:89 信号 / 36% WR / +13.4R)— 主力
+    liquidity_raid: true           # 扫荡反转 + 教科书 MSS 确认(365d:34 信号 / 39% WR / +16.4R)
+    mss_retest: false              # 4h MSS retest(加教科书 gate 后 365d 16 单打平,不值得开)
 
-  # iFVG reversed 入场参数(消费 SMC 4h_fvg SL'd POI)
-  ifvg_rr_min: 1.0                 # RR 最低门槛(老门槛 1.5 太严,sl_hit_extreme 作 TP 常达不到)
+  # RR 最低门槛(mss_retest 路径使用;原 iFVG 配置,iFVG 已随 SMC 管线删除)
+  ifvg_rr_min: 1.0
 
   # 教科书 ICT 确认 gate(2026-06-09 补足)—— displacement / MSS 确认
   # ICT 的 edge 来自"机构位移"(displacement 会在 3-candle 留下 FVG)。缺这道证据的
@@ -109,4 +92,3 @@ ict:
   h4_bias_enabled: false
   h4_bias_lookback: 60             # 4h ATR pivot 窗口(根)
   h4_bias_min_move_mult: 0.5       # 0.5 = 灵敏,但太敏感误拦反弹中的 short
-

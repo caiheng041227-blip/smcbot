@@ -10,7 +10,7 @@
   - 复用 engine.market_structure 的 ATR pivot 工具
   - 不写防御性 try/except —— 输入异常时返回 'neutral' / None 即可
 
-接入点见 smc_signal/state_machine._check_step1 + scripts/backtest.py。
+接入点见 ict_signal/state_machine(HTF gates)+ scripts/backtest.py。
 """
 from __future__ import annotations
 

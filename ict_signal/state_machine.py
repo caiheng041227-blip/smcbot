@@ -1,22 +1,17 @@
-"""ICT (Inner Circle Trader) 信号引擎 — 与 SMC 完全独立的 pipeline。
+"""ICT (Inner Circle Trader) 信号引擎 — 项目唯一信号 pipeline(SMC 管线 2026-06-10 删除)。
 
-Phase A 范围:
-  - iFVG 反向二次入场(消费 SMC 4h_fvg 失败 POI,翻方向 short / long)
+范围:
+  - 4 个 ICT POI 检测器(engine/ict_pois.py):ob / ote / liquidity_raid / mss_retest
   - HTF gates(daily bias + premium/discount)在入场时硬过滤
-  - 信号注入 SignalTracker(走现有 hybrid ATR trail,Phase B 升级为结构 trail)
-
-不在 Phase A 范围(留 Phase B):
-  - 结构 SL trail(LH/HL pivot)
-  - HTF (4h) CHoCH 退出
-  - BOS 确认 → break-even
-  - FVG 填补警告
-  - 独立 ICT POI 类型(OTE / OB 直接识别,不靠 SMC 失败 POI)
+  - 教科书确认 gate:反转类 setup 要求 displacement-FVG 证据
+  - 信号注入 SignalTracker(advisory TP1/SL/trail 监视)
 
 驱动方式:
   main.py 在每根 K 线 close 时调 self.on_candle_close()
   内部分发:
-    - 1h close → check_ifvg_reentry(扫 failed_pois)
-    - 其他 tf → 暂时 no-op(Phase B 加 4h close handler)
+    - 4h close → 扫 OB / OTE + 注册 pending MSS
+    - 1h close → 扫 Liquidity Raid Reversal + 检查 pending MSS retest
+    - 其他 tf → 只更新时间锚 / 清理过期
 """
 from __future__ import annotations
 
@@ -34,14 +29,14 @@ from engine.ict_pois import (
     find_ict_mss_retest_setups,
     _has_displacement_fvg,
 )
-from smc_signal.state_machine import SignalState, SignalStep
+from ict_signal.signal_state import SignalState, SignalStep
 from utils.logger import logger
 
 
 class ICTSignalEngine:
     """ICT 流派信号 engine。
 
-    与 smc_signal.SignalEngine 接口对称:
+    对外接口:
       - active_signals: Dict[str, SignalState]
       - on_candle_close(symbol, tf, candle, db) → None
       - get_notification_ready() → List[SignalState]
@@ -52,12 +47,12 @@ class ICTSignalEngine:
     def __init__(
         self,
         candle_manager,
-        scorer,
-        config: Dict[str, Any],
+        scorer=None,
+        config: Dict[str, Any] = None,
     ):
         """
         candle_manager: 与 SMC engine 共用同一个 CandleManager(共享 K 线池,不双订阅)
-        scorer:         保留接口,Phase A 不使用(ICT 信号统一 score=3.0)
+        scorer:         保留接口,未使用(ICT 信号统一 score=3.0;SMC scorer 已删除)
         config:         整个 cfg dict,内部读 config.ict.*
         """
         self.candles = candle_manager
@@ -84,8 +79,8 @@ class ICTSignalEngine:
         self.h4_bias_min_move = float(ict_cfg.get("h4_bias_min_move_mult", 0.5))
         self.h4_bias_lookback = int(ict_cfg.get("h4_bias_lookback", 60))
 
-        # iFVG reversed 配置
-        self.ifvg_rr_min = float(ict_cfg.get("ifvg_rr_min", 1.0))  # RR 最低门槛
+        # RR 最低门槛(原 iFVG 配置;iFVG 路径已随 SMC 管线删除,mss_retest 仍复用)
+        self.ifvg_rr_min = float(ict_cfg.get("ifvg_rr_min", 1.0))
         # 教科书 ICT 确认 gate(2026-06-09 补足):displacement / MSS 确认
         # require_displacement:反转类 setup(liquidity_raid + mss_retest)的位移确认
         self.require_displacement = bool(ict_cfg.get("require_displacement", True))
@@ -153,7 +148,12 @@ class ICTSignalEngine:
         return dict(self._diag)
 
     def get_notification_ready(self) -> List[SignalState]:
-        """取所有 SCORED + 未推送 + 未过期的 ICT 信号。"""
+        """取所有 SCORED + 未推送 + 未过期的 ICT 信号,并标记为已推送。
+
+        2026-06-10:补上标记副作用(notification_sent + step=NOTIFIED)。
+        原先这个语义在 SMC engine 的同名方法里,删 SMC 管线时丢失 —— 没有它,
+        notify_loop 每 5s 会把同一条信号重复推送 36h,且 tracker 被反复重置。
+        """
         now = self._now()
         ready: List[SignalState] = []
         for s in self.active_signals.values():
@@ -163,6 +163,9 @@ class ICTSignalEngine:
                 continue
             if s.expires_at and now > s.expires_at:
                 continue
+            s.notification_sent = True
+            s.step = SignalStep.NOTIFIED
+            s.updated_at = now
             ready.append(s)
         return ready
 
@@ -171,7 +174,7 @@ class ICTSignalEngine:
 
         分发(Phase A v2):
           - 4h close → 扫 OB / OTE / MSS retest
-          - 1h close → 扫 iFVG retest + Liquidity Raid Reversal
+          - 1h close → 扫 Liquidity Raid Reversal
         """
         if not self.engine_enabled:
             return
@@ -182,7 +185,6 @@ class ICTSignalEngine:
         if timeframe == "4h":
             self._scan_4h_setups(symbol, candle)
         elif timeframe == "1h":
-            await self._check_ifvg_reentry(symbol, candle, db)
             self._scan_1h_setups(symbol, candle)
 
     def _expire_stale(self) -> None:
@@ -191,6 +193,7 @@ class ICTSignalEngine:
             s = self.active_signals[sid]
             if s.expires_at and now > s.expires_at and s.step in (
                 SignalStep.SCORED,
+                SignalStep.NOTIFIED,
             ) and s.notification_sent:
                 # 已推送过 + 已过 TTL → 从内存删除
                 del self.active_signals[sid]
@@ -250,154 +253,6 @@ class ICTSignalEngine:
             premium_threshold=self.premium_threshold,
             discount_threshold=self.discount_threshold,
         )
-
-    # ---- iFVG reversed 入场 ----
-    async def _check_ifvg_reentry(self, symbol: str, candle: Any, db: Any) -> List[str]:
-        """ICT iFVG 反向二次入场。
-
-        ICT 原意:
-          - bullish FVG 被 close 击穿 → zone 翻转为 bearish iFVG(supply)
-          - 价格回到 zone = SHORT 入场
-          - SL 在 zone 上沿 + buf,TP 在 sl_hit_extreme
-
-        与原版 SMC IFVG 的唯一区别:**方向反转**(原 long → 新 short / 原 short → 新 long)
-        并加入 HTF gates(daily bias + premium/discount)硬过滤。
-        """
-        new_sids: List[str] = []
-        if db is None or candle is None:
-            return new_sids
-        try:
-            await db.expire_failed_pois()
-            failed = await db.get_active_failed_pois(symbol)
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"[ICT] check_ifvg_reentry db 查询失败 {e}")
-            return new_sids
-        if not failed:
-            return new_sids
-
-        hi = float(candle["high"] if isinstance(candle, dict) else candle.high)
-        lo = float(candle["low"] if isinstance(candle, dict) else candle.low)
-        close = float(candle["close"] if isinstance(candle, dict) else candle.close)
-
-        for fp in failed:
-            try:
-                orig_direction = fp["direction"]
-                poi_low = float(fp["poi_low"])
-                poi_high = float(fp["poi_high"])
-                cur_extreme = fp.get("sl_hit_extreme")
-
-                # 跟踪 sl_hit_extreme(原方向失败后的最深反向极值)
-                if orig_direction == "long":
-                    new_ext = lo if cur_extreme is None else min(float(cur_extreme), lo)
-                    if cur_extreme is None or new_ext < float(cur_extreme):
-                        await db.update_failed_poi_extreme(fp["id"], new_ext)
-                    cur_extreme = new_ext
-                else:
-                    new_ext = hi if cur_extreme is None else max(float(cur_extreme), hi)
-                    if cur_extreme is None or new_ext > float(cur_extreme):
-                        await db.update_failed_poi_extreme(fp["id"], new_ext)
-                    cur_extreme = new_ext
-
-                # 回踩判定
-                reentered = False
-                if orig_direction == "long" and hi >= poi_low:
-                    reentered = True
-                elif orig_direction == "short" and lo <= poi_high:
-                    reentered = True
-                if not reentered:
-                    continue
-
-                # ★ 翻方向
-                new_direction = "short" if orig_direction == "long" else "long"
-                entry = close
-
-                # HTF gates ① daily bias
-                daily_bias = self._check_daily_bias(symbol)
-                if daily_bias == "bearish" and new_direction == "long":
-                    self._diag["ifvg_veto_daily_bias_long"] += 1
-                    logger.info(f"[ICT] iFVG long 被 daily_bias=bearish 否决")
-                    continue
-                if daily_bias == "bullish" and new_direction == "short":
-                    self._diag["ifvg_veto_daily_bias_short"] += 1
-                    logger.info(f"[ICT] iFVG short 被 daily_bias=bullish 否决")
-                    continue
-
-                # HTF gates ② premium/discount
-                zone = self._check_zone(symbol, entry)
-                if zone == "premium" and new_direction == "long":
-                    self._diag["ifvg_veto_premium_long"] += 1
-                    logger.info(f"[ICT] iFVG long 被 premium zone 否决")
-                    continue
-                if zone == "discount" and new_direction == "short":
-                    self._diag["ifvg_veto_discount_short"] += 1
-                    logger.info(f"[ICT] iFVG short 被 discount zone 否决")
-                    continue
-
-                # 计算 entry/SL/TP
-                poi_height = poi_high - poi_low
-                sl_buf = poi_height * 0.5
-                if new_direction == "short":
-                    new_sl = poi_high + sl_buf
-                    tp_target = float(cur_extreme)
-                    if entry >= new_sl or entry <= tp_target:
-                        self._diag["ifvg_constraint_fail"] += 1
-                        continue
-                    risk = new_sl - entry
-                    reward = entry - tp_target
-                else:
-                    new_sl = poi_low - sl_buf
-                    tp_target = float(cur_extreme)
-                    if entry <= new_sl or entry >= tp_target:
-                        self._diag["ifvg_constraint_fail"] += 1
-                        continue
-                    risk = entry - new_sl
-                    reward = tp_target - entry
-
-                if risk <= 0:
-                    continue
-                rr = reward / risk
-                if rr < self.ifvg_rr_min:
-                    self._diag["ifvg_rr_too_low"] += 1
-                    continue
-
-                sid = str(uuid.uuid4())
-                now = self._now()
-                self.active_signals[sid] = SignalState(
-                    signal_id=sid,
-                    symbol=symbol,
-                    direction=new_direction,
-                    step=SignalStep.SCORED,
-                    poi_source="4h_fvg_ifvg",
-                    poi_type="bearish_fvg_ifvg" if new_direction == "short" else "bullish_fvg_ifvg",
-                    poi_low=poi_low,
-                    poi_high=poi_high,
-                    triggered_level="POI_high" if new_direction == "short" else "POI_low",
-                    triggered_level_value=poi_high if new_direction == "short" else poi_low,
-                    entry_price=entry,
-                    stop_loss=new_sl,
-                    take_profit=tp_target,
-                    risk_reward=rr,
-                    entry_mode="immediate",  # iFVG 是回踩即成交,不走 limit 等待
-                    total_score=3.0,
-                    scores={"C_POI": 3.0, "C_Vol": 0.0, "C_Delta": 0.0,
-                            "C_Override": 0.0, "C_Confluence": 0.0, "C_Fib": 0.0},
-                    created_at=now,
-                    updated_at=now,
-                    expires_at=now + self.signal_ttl,
-                    notification_sent=False,
-                    source_engine="ict",
-                )
-                await db.mark_failed_poi_reentered(fp["id"], sid)
-                new_sids.append(sid)
-                self._diag["ifvg_signals_created"] += 1
-                logger.info(
-                    f"[ICT-iFVG] 创建反向二次入场 {sid[:8]} {new_direction} "
-                    f"(原 {orig_direction} 失败) entry={entry:.2f} SL={new_sl:.2f} "
-                    f"TP={tp_target:.2f} RR={rr:.2f} (原信号 {fp['original_signal_id'][:8]})"
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"[ICT] check_ifvg_reentry 处理 failed_poi {fp.get('id')} 失败: {e}")
-        return new_sids
 
     # ========================================================================
     # 新 POI 入口(4h close / 1h close 分别触发)

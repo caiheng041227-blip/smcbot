@@ -28,14 +28,11 @@ from data.rest_backfill import backfill_to_manager, fetch_klines
 from datetime import timedelta
 from engine.delta import DeltaTracker
 from engine.key_levels import KeyLevels
-from engine.market_structure import classify_structure
 from engine.volume_profile import VolumeProfileSession, WeeklyVolumeProfileSession
 from gbrain_integration.logger import log_signal as gbrain_log_signal
 from notify import TelegramNotifier
 from notify.signal_tracker import SignalTracker
-from smc_signal import SignalEngine, score as signal_score
-from smc_signal.state_machine import SignalStep
-from ict_signal import ICTSignalEngine
+from ict_signal import ICTSignalEngine, SignalStep
 from storage.database import Database
 from utils.logger import logger, setup_logger
 
@@ -45,19 +42,19 @@ async def replay_recent_state(
     timeframes: list,
     hours: int,
     candles: CandleManager,
-    engine: SignalEngine,
+    ict_engine: ICTSignalEngine,
     weekly_vp: WeeklyVolumeProfileSession,
     levels: KeyLevels,
     proxy: Optional[str] = None,
     db: Optional[Any] = None,
 ) -> None:
-    """重启后回放近 N 小时历史,重建 state_machine 的 active_signals + VP/levels。
+    """重启后回放近 N 小时历史,重建 ICT engine 的 active_signals + VP/levels。
 
     逻辑:
       - 拉每个 TF 足够历史(warmup + 回放窗口)
       - 按 close_time 合并排序,按时间轴重放
       - close_time < cutoff:仅喂 CandleManager(为后续 engine.window 预热)
-      - close_time >= cutoff:额外驱动 engine + 更新 VP/levels + delta 近似
+      - close_time >= cutoff:额外驱动 engine + 更新 VP/levels
       - 回放结束后,所有在回放中推进到 SCORED 的信号标为 notification_sent=True
         → 防止 live notify_loop 启动后把过期信号误推送出去
     """
@@ -65,7 +62,7 @@ async def replay_recent_state(
     tfs = [t for t in timeframes if t != "1m"]  # 1m 不驱动 state_machine
     bar_counts = {
         "1d": 30,
-        "4h": 80,
+        "4h": 130,  # ICT _scan_4h 用 window(100) + dealing_range lookback 60,预热给足
         "1h": max(200, hours + 100),
         "15m": max(300, hours * 4 + 200),
     }
@@ -101,10 +98,8 @@ async def replay_recent_state(
                 levels.update_prev_week(locked)
             levels.update_weekly(c.close, ts)
             levels.update_monthly(c.close, ts)
-        d_approx = c.volume * (0.6 if c.close > c.open else -0.6 if c.close < c.open else 0.0)
-        engine.set_bar_delta(tf, d_approx)
         try:
-            await engine.on_candle_close(symbol, tf, c)
+            await ict_engine.on_candle_close(symbol, tf, c, db)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"replay on_candle_close 异常 {tf}@{close_time}: {e}")
         replayed += 1
@@ -112,7 +107,7 @@ async def replay_recent_state(
     suppressed = 0
     alive_by_step: dict = {}
     persisted = 0
-    for sid, s in list(engine.active_signals.items()):
+    for sid, s in list(ict_engine.active_signals.items()):
         if s.step == SignalStep.SCORED:
             # 落盘(在抑制 notification 之前):/signals 命令能查到回放期 SCORED 信号
             if db is not None:
@@ -194,42 +189,15 @@ async def main_async() -> None:
     db = Database(str(db_path))
     await db.connect()
 
-    # SMC 信号引擎(原有)
-    engine = SignalEngine(
+    # ICT 信号引擎(项目唯一信号 pipeline;SMC 管线 2026-06-10 删除)
+    ict_engine: ICTSignalEngine = ICTSignalEngine(
         candle_manager=candles,
-        key_levels=levels,
-        scorer=signal_score,
-        config=cfg,
-    )
-    engine.set_vp_provider(lambda: vp_session.current())
-
-    # ICT 信号引擎(独立 pipeline,默认 OFF;通过 config.ict.engine_enabled 启用)
-    ict_engine: Optional[ICTSignalEngine] = ICTSignalEngine(
-        candle_manager=candles,
-        scorer=signal_score,
         config=cfg,
     )
     if ict_engine.engine_enabled:
         logger.info("ICT engine 已启用")
     else:
         logger.info("ICT engine 已加载但未启用(config.ict.engine_enabled=false)")
-
-    # BTC 联动过滤:参考品种结构与 ETH 方向冲突 → 否决 Step1
-    ref_cfg = cfg.get("reference") or {}
-    ref_symbol = (ref_cfg.get("symbol") or "").upper() or None
-    ref_tf = ref_cfg.get("timeframe") or "4h"
-    if ref_symbol:
-        swing_lb = int(cfg.get("signal", {}).get("swing_lookback", 5))
-        def _correlation_gate(direction: str) -> bool:
-            ref_candles = candles.window(ref_symbol, ref_tf, 50)
-            if len(ref_candles) < 2 * swing_lb + 3:
-                return True  # 参考数据不足时不卡
-            ref_struct = classify_structure(ref_candles, swing_lb)
-            if ref_struct == "neutral":
-                return True  # BTC 方向不明时不卡
-            want = "bullish" if direction == "long" else "bearish"
-            return ref_struct == want
-        engine.set_correlation_gate(_correlation_gate)
 
     # Telegram 通知器(token/chat_id 从环境变量读取,缺失则降级为仅日志)
     tg_token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -238,22 +206,19 @@ async def main_async() -> None:
     notifier: Optional[TelegramNotifier] = None
 
     # Signal tracker(advisory TP1/TP2/SL 监视,不下单)
-    ict_cfg = cfg.get("ict") or {}
-    ict_engine_on = bool(ict_cfg.get("engine_enabled", False))
     tracker = SignalTracker(db=db, notifier=None, symbol=symbol,
-                            trail_mult=1.5, tp1_portion=0.5,
-                            ict_engine_enabled=ict_engine_on)
+                            trail_mult=1.5, tp1_portion=0.5)
     await tracker.start()
 
     if tg_token and tg_chat:
         notifier = TelegramNotifier(
             token=tg_token, chat_id=tg_chat, proxy=tg_proxy,
-            db=db, engine=engine, tracker=tracker, tz_name=tz_name,
+            db=db, engine=ict_engine, tracker=tracker, tz_name=tz_name,
         )
         await notifier.start()
         tracker.notifier = notifier  # 双向绑定,让 tracker 能发 TG 提醒
         await notifier.send_text(
-            "🤖 SMC Bot 已启动，开始监控 ETHUSDT\n\n"
+            "🤖 ICT Bot 已启动，开始监控 ETHUSDT\n\n"
             "👇 点下方按钮查询,或输入 /help 看命令",
             with_keyboard=True,
         )
@@ -262,11 +227,9 @@ async def main_async() -> None:
 
     # K 线 close 回调：打印 + 落盘 + 切换 per-bar delta + 驱动状态机
     def on_candle_close(sym: str, tf: str, c: Candle) -> None:
-        # 主品种才切 delta bar + 驱状态机;ref_symbol(BTC)仅存 candle 供 correlation gate 读
         is_main = (sym == symbol)
         if is_main:
             bar_delta = delta.reset_bar(tf)
-            engine.set_bar_delta(tf, bar_delta)
             logger.info(
                 f"[KLINE {sym} {tf}] O={c.open} H={c.high} L={c.low} C={c.close} "
                 f"V={c.volume:.2f}  barDelta={bar_delta:+.2f}  CVD={delta.cvd:+.2f}"
@@ -278,11 +241,8 @@ async def main_async() -> None:
                              c.open, c.high, c.low, c.close, c.volume)
         )
         if is_main:
-            # SMC engine 推进
-            asyncio.create_task(engine.on_candle_close(sym, tf, c))
-            # ICT engine 推进(独立 pipeline,见 ict_signal/state_machine.py)
-            if ict_engine is not None:
-                asyncio.create_task(ict_engine.on_candle_close(sym, tf, c, db))
+            # ICT engine 推进(项目唯一信号 pipeline)
+            asyncio.create_task(ict_engine.on_candle_close(sym, tf, c, db))
             # 仓位追踪:在 15m 收盘扫描所有 open tracker 的 TP1/SL/Trail 条件
             if tf == "15m":
                 asyncio.create_task(tracker.on_candle(sym, c))
@@ -301,7 +261,7 @@ async def main_async() -> None:
                 timeframes=kline_tfs,
                 hours=replay_hours,
                 candles=candles,
-                engine=engine,
+                ict_engine=ict_engine,
                 weekly_vp=weekly_vp,
                 levels=levels,
                 proxy=bf_proxy,
@@ -309,10 +269,8 @@ async def main_async() -> None:
             )
         else:
             # 回放关闭时退回原纯回填行为
-            backfill_counts = {"1d": 30, "4h": 50, "1h": 200, "15m": 200}
+            backfill_counts = {"1d": 30, "4h": 130, "1h": 200, "15m": 200}
             await backfill_to_manager(candles, symbol, kline_tfs, backfill_counts, proxy=bf_proxy)
-        if ref_symbol:
-            await backfill_to_manager(candles, ref_symbol, [ref_tf], {ref_tf: 50}, proxy=bf_proxy)
     except Exception as e:  # noqa: BLE001
         logger.error(f"REST 回填/状态回放失败(继续用 WS 冷启动): {e}")
 
@@ -336,7 +294,7 @@ async def main_async() -> None:
             win = candles.window(symbol, tf, _HB_WIN[tf])
             if len(win) >= 13:
                 if tf in ("1h", "4h", "1d"):
-                    atr_v = engine._atr(symbol, tf)
+                    atr_v = ict_engine._atr(symbol, tf)
                     struct[tf] = (
                         classify_structure_atr(win, atr_v, 1.0)
                         if atr_v > 0 else classify_structure(win, _HB_LB)
@@ -349,25 +307,17 @@ async def main_async() -> None:
             if last:
                 close_prices[tf] = last.close
 
-        # ---- 推断阻塞原因 ----
-        blocker = ""
-        m15 = struct.get("15m", "?")
-        if m15 in ("bullish", "bearish"):
-            for tf_name in ("D1", "4h", "1h"):
-                tf_key = "1d" if tf_name == "D1" else tf_name
-                st = struct.get(tf_key, "neutral")
-                if st in ("bullish", "bearish") and st != m15:
-                    dir_cn = "long" if m15 == "bullish" else "short"
-                    blocker = f"{tf_name}={st} 阻塞 {dir_cn}"
-                    break
-        elif m15 == "neutral":
-            blocker = "15m 结构 neutral,Step1 主驱动失活"
+        # ---- ICT gate 状态(daily bias 决定方向准入)----
+        try:
+            daily_bias = ict_engine._check_daily_bias(symbol) or "neutral"
+        except Exception:  # noqa: BLE001
+            daily_bias = "?"
 
         # ---- 组装文本 ----
         now_et = datetime.now(timezone.utc).astimezone(_hb_ny).strftime("%m-%d %H:%M ET")
         emoji_map = {"bullish": "🟢", "bearish": "🔴", "neutral": "⚪", "?": "❓"}
         lines = [
-            f"🫀 SMC Bot 心跳 [{now_et}]",
+            f"🫀 ICT Bot 心跳 [{now_et}]",
             f"━━━━━━━━━━━━━━━",
             f"🔍 4 TF 结构:",
         ]
@@ -375,10 +325,9 @@ async def main_async() -> None:
             px = close_prices.get(tf)
             px_str = f"  C={px:.2f}" if px else ""
             lines.append(f"  {emoji_map.get(st, '?')} {tf:<4} {st}{px_str}")
-        if blocker:
-            lines.extend(["", f"🚧 {blocker}"])
-        else:
-            lines.extend(["", "✓ 各 TF 对齐,等待 setup 形成"])
+        bias_note = {"bullish": "只放行 long", "bearish": "只放行 short",
+                     "neutral": "两向均可", "?": "数据不足"}.get(daily_bias, "")
+        lines.extend(["", f"🧭 ICT daily bias: {emoji_map.get(daily_bias, '❓')} {daily_bias}({bias_note})"])
         return "\n".join(lines)
 
     async def heartbeat_loop():
@@ -399,7 +348,7 @@ async def main_async() -> None:
             await asyncio.sleep(hours * 3600)
 
     async def notify_loop():
-        from smc_signal.state_machine import SignalStep as _SS
+        _SS = SignalStep
 
         async def _process_engine_signals(eng, eng_name: str):
             """处理单个 engine 的 SCORED 信号:落盘 + 推送 + tracker.add。"""
@@ -430,8 +379,7 @@ async def main_async() -> None:
 
         while True:
             try:
-                await _process_engine_signals(engine, "SMC")
-                if ict_engine is not None and ict_engine.engine_enabled:
+                if ict_engine.engine_enabled:
                     await _process_engine_signals(ict_engine, "ICT")
             except Exception as e:
                 logger.error(f"notify_loop 异常: {e}")
@@ -481,8 +429,6 @@ async def main_async() -> None:
     # ----- Wire up -------------------------------------------------------
 
     extra_streams: list[str] = []
-    if ref_symbol:
-        extra_streams.append(f"{ref_symbol.lower()}@kline_{ref_tf}")
 
     # 交易所选择:exchange=binance / okx(默认 binance,Lightsail/美东部署用 okx 避开 Binance geo 限制)
     exchange = (cfg.get("exchange") or "binance").lower()

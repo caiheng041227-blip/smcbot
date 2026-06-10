@@ -567,7 +567,7 @@ class TelegramNotifier:
             return
         kb = _build_reply_keyboard()
         await update.message.reply_text(
-            "<b>SMC Bot 命令</b>\n\n"
+            "<b>ICT Bot 命令</b>\n\n"
             "👇 <b>点下方按钮</b>(推荐) 或输入 /命令\n\n"
             "<code>/signals [小时]</code>  查近 N 小时(默认 6,最多 168)\n"
             "<code>/active</code>          当前 in-flight 信号\n"
@@ -580,7 +580,7 @@ class TelegramNotifier:
         )
 
     async def _cmd_heartbeat(self, update: Any, context: Any) -> None:
-        """SMC bot 心跳:推一条与定时心跳完全相同的状态消息。
+        """ICT bot 心跳:推一条与定时心跳完全相同的状态消息。
         依赖 main.py 在初始化时把 build_heartbeat_text 注入 self.heartbeat_text_builder。
         """
         if not self._is_authorized(update):
