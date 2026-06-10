@@ -32,6 +32,7 @@ from engine.ict_pois import (
     find_ict_ote_setups,
     find_ict_liquidity_raid_setups,
     find_ict_mss_retest_setups,
+    _has_displacement_fvg,
 )
 from smc_signal.state_machine import SignalState, SignalStep
 from utils.logger import logger
@@ -85,6 +86,14 @@ class ICTSignalEngine:
 
         # iFVG reversed 配置
         self.ifvg_rr_min = float(ict_cfg.get("ifvg_rr_min", 1.0))  # RR 最低门槛
+        # 教科书 ICT 确认 gate(2026-06-09 补足):displacement / MSS 确认
+        # require_displacement:反转类 setup(liquidity_raid + mss_retest)的位移确认
+        self.require_displacement = bool(ict_cfg.get("require_displacement", True))
+        # ote_require_displacement:OTE 额外 FVG-位移过滤。365d 数据显示净亏(OTE 的位移
+        # 已由 swing_min_move_mult=1.5 腿幅保证),默认 OFF。
+        self.ote_require_displacement = bool(ict_cfg.get("ote_require_displacement", False))
+        self.displacement_min_height_atr = float(ict_cfg.get("displacement_min_height_atr", 0.25))
+        self.raid_confirm_within_bars = int(ict_cfg.get("raid_confirm_within_bars", 5))
         # 4 个 POI 类型独立开关(Phase A 默认: OB+OTE+raid 开,mss_retest 关 — 后者需 2 步状态机)
         self.pois_enabled = ict_cfg.get("pois") or {}
         self.poi_ob_enabled = bool(self.pois_enabled.get("ob", True))
@@ -559,6 +568,8 @@ class ICTSignalEngine:
             ote_setups = find_ict_ote_setups(
                 candles_4h, atr_4h, current_price,
                 daily_bias=daily_bias, dealing_range=dr,
+                require_displacement=self.ote_require_displacement,
+                displacement_min_height_atr=self.displacement_min_height_atr,
             )
             for setup in ote_setups:
                 sid = self._emit_setup(symbol, setup)
@@ -590,6 +601,9 @@ class ICTSignalEngine:
                 candles_1h, atr_1h, current_price,
                 daily_bias=daily_bias, dealing_range=dr,
                 premium_th=self.premium_threshold, discount_th=self.discount_threshold,
+                sweep_window_bars=self.raid_confirm_within_bars,
+                require_confirmation=self.require_displacement,
+                confirm_min_height_atr=self.displacement_min_height_atr,
             )
             for setup in raid_setups:
                 sid = self._emit_setup(symbol, setup)
@@ -624,6 +638,13 @@ class ICTSignalEngine:
         if daily_bias == "bearish" and setup_dir == "long":
             return
         if daily_bias == "bullish" and setup_dir == "short":
+            return
+        # 教科书 ICT:真 MSS 的突破必须是位移(末尾几根留下方向一致 FVG),
+        # 否则只是裸 close-break CHoCH,不注册 pending。
+        if self.require_displacement and not _has_displacement_fvg(
+            candles_4h, setup_dir, since_index=len(candles_4h) - 3,
+            min_height=self.displacement_min_height_atr * atr_4h,
+        ):
             return
         key = (symbol, mss_dir, break_time)
         if key in self._pending_mss:

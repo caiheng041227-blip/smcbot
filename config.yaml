@@ -78,6 +78,19 @@ ict:
   # iFVG reversed 入场参数(消费 SMC 4h_fvg SL'd POI)
   ifvg_rr_min: 1.0                 # RR 最低门槛(老门槛 1.5 太严,sl_hit_extreme 作 TP 常达不到)
 
+  # 教科书 ICT 确认 gate(2026-06-09 补足)—— displacement / MSS 确认
+  # ICT 的 edge 来自"机构位移"(displacement 会在 3-candle 留下 FVG)。缺这道证据的
+  # setup 退化成"猜反转",trending 市场系统性失败。三处接入:
+  #   - OTE:leg 必须是位移腿(leg 内有方向一致 FVG)
+  #   - liquidity_raid:扫荡后必须有反向位移确认(turtle soup 的 MSS 腿)
+  #   - mss_retest:突破必须是位移,区分真 MSS 与裸 CHoCH
+  require_displacement: true       # 反转类(raid+mss_retest)位移确认。365d:raid -8.9R→+16.4R
+  ote_require_displacement: false  # OTE 额外 FVG 过滤。365d 实测净亏(-10R):OTE 位移已由
+                                   # swing_min_move_mult=1.5 腿幅保证,额外 gate 过度约束,默认 OFF
+  displacement_min_height_atr: 0.0 # 位移 FVG 最小高度(×ATR)。0.0=任意方向 FVG 即确认。
+                                   # 365d:raid 34单/+16.4R,比 0.25(14单)样本更厚更稳;0.5 崩(勿上调)
+  raid_confirm_within_bars: 5      # liquidity_raid 反向位移 FVG / sweep 窗口(根)
+
   # HTF gates 之 ① Daily MSS bias
   daily_bias_enabled: true         # 违反 daily bias 方向的 ICT 信号被否决
   daily_bias_lookback: 30          # ATR pivot 在 D1 上找 swing 的窗口(根)

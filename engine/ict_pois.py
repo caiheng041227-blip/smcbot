@@ -22,12 +22,65 @@ from engine.market_structure import (
     find_swing_points_atr,
     _h, _l, _close, _t,
 )
-from engine.poi import find_order_blocks, find_equal_lows_highs_pois
+from engine.poi import find_order_blocks, find_equal_lows_highs_pois, find_fvgs
 
 
 # ----------------------------------------------------------------------------
 # 共用工具
 # ----------------------------------------------------------------------------
+
+def _has_displacement_fvg(
+    candles: Sequence[Any],
+    direction: str,
+    since_index: int = 0,
+    min_height: float = 0.0,
+) -> bool:
+    """ICT displacement 证据:在 [since_index, 末尾] 区间内存在方向一致、未填补的 FVG。
+
+    教科书 ICT 把"位移"(displacement)定义为一段强势的失衡推进 —— 它会在 3-candle
+    结构里留下一个 FVG(fair value gap)。所以:
+      - bullish 位移 → 留 bullish_fvg(支持 long setup)
+      - bearish 位移 → 留 bearish_fvg(支持 short setup)
+    没有这个 FVG = 那段腿只是普通摆动,不是机构位移,ICT setup 不成立。
+
+    since_index:只认这一根(含)之后形成的 FVG —— 把位移绑定到当前 leg / 突破,
+    避免拿很久以前的老 FVG 来"凑"位移。
+    """
+    want = "bullish_fvg" if direction == "long" else "bearish_fvg"
+    n = len(candles)
+    since = max(0, since_index)
+    lookback = n - since + 3  # 覆盖 [since, n) 全段(+3 容 3-candle 结构边界)
+    fvgs = find_fvgs(list(candles), lookback=lookback, min_height=min_height)
+    return any(f["direction"] == want and f["index"] >= since for f in fvgs)
+
+
+def _leg_displaced(
+    candles: Sequence[Any],
+    direction: str,
+    start_index: int,
+    end_index: int,
+    min_height: float = 0.0,
+) -> bool:
+    """leg [start, end] 内是否发生过位移 —— **fill-agnostic** 版的 FVG 检测。
+
+    与 _has_displacement_fvg 的区别:这里只问"当初有没有跳空(3-candle 缺口)",
+    不管缺口之后是否被填。OTE 专用 —— OTE 的入场本身就是价格回撤填这个缺口,
+    若要求缺口仍未填补,等于自我否决,会把绝大多数合法 OTE 误杀。
+
+    bullish leg(long):向上跳空 k1.high < k3.low;bearish 对称。
+    """
+    lo = max(0, start_index)
+    hi = min(end_index, len(candles) - 1)
+    for i in range(lo, hi - 1):
+        k1, k3 = candles[i], candles[i + 2]
+        if direction == "long":
+            if _h(k1) < _l(k3) and (_l(k3) - _h(k1)) >= min_height:
+                return True
+        else:
+            if _l(k1) > _h(k3) and (_l(k1) - _h(k3)) >= min_height:
+                return True
+    return False
+
 
 def _check_gates(direction: str, daily_bias: Optional[str],
                  zone: Optional[str]) -> bool:
@@ -178,6 +231,8 @@ def find_ict_ote_setups(
     ote_high_pct: float = 0.79,
     sl_atr_mult: float = 0.3,
     min_rr: float = 1.0,
+    require_displacement: bool = True,
+    displacement_min_height_atr: float = 0.25,
 ) -> List[Dict[str, Any]]:
     """OTE 检测:最近 4h 显著 leg 的 62-79% 回撤区间 + HTF aligned。
 
@@ -220,6 +275,16 @@ def find_ict_ote_setups(
     # HTF gate
     if not _check_gates(leg_dir, daily_bias, None):
         return []
+    # 教科书 ICT:OTE 只在"位移腿"上有效 —— leg 内必须发生过方向一致的跳空(位移)。
+    # 用 fill-agnostic 检测:OTE 入场本身会填掉 leg 的 FVG,所以只看位移是否发生过。
+    if require_displacement:
+        leg_start_idx = min(int(last_h["index"]), int(last_l["index"]))
+        leg_end_idx = max(int(last_h["index"]), int(last_l["index"]))
+        if not _leg_displaced(
+            candles_4h, leg_dir, leg_start_idx, leg_end_idx,
+            min_height=displacement_min_height_atr * atr_4h,
+        ):
+            return []
 
     entry = current_price
     if leg_dir == "long":
@@ -286,6 +351,8 @@ def find_ict_liquidity_raid_setups(
     min_rr: float = 1.0,
     premium_th: float = 0.55,
     discount_th: float = 0.45,
+    require_confirmation: bool = True,
+    confirm_min_height_atr: float = 0.25,
 ) -> List[Dict[str, Any]]:
     """Liquidity Raid Reversal:equal H/L 被扫破但 close 回到原区间(stop hunt 失败)。
 
@@ -295,8 +362,10 @@ def find_ict_liquidity_raid_setups(
          - SSL: low < poi_low 但 close >= poi_low(下扫但收回)→ 做 long
          - BSL: high > poi_high 但 close <= poi_high(上扫但收回)→ 做 short
       3. HTF gates 过滤
-      4. SL = 扫荡极值 ± sl_atr_mult × ATR_1h
-      5. TP = dealing_range 对侧
+      4. 教科书确认(require_confirmation):扫荡后必须有反向位移(MSS)证据 ——
+         最近 sweep_window_bars 根内出现方向一致的 FVG。缺确认 = 纯猜反转,跳过。
+      5. SL = 扫荡极值 ± sl_atr_mult × ATR_1h
+      6. TP = dealing_range 对侧
     """
     if not candles_1h or atr_1h <= 0 or len(candles_1h) < 5:
         return []
@@ -326,6 +395,12 @@ def find_ict_liquidity_raid_setups(
                 continue
             zone = _compute_zone(last_close, dealing_range, premium_th, discount_th)
             if zone == "premium":
+                continue
+            # 教科书确认:扫荡 SSL 后必须有 bullish 位移(反转推进留下的 FVG)
+            if require_confirmation and not _has_displacement_fvg(
+                candles_1h, "long", since_index=len(candles_1h) - sweep_window_bars,
+                min_height=confirm_min_height_atr * atr_1h,
+            ):
                 continue
             entry = last_close
             sl = window_min_low - sl_atr_mult * atr_1h
@@ -372,6 +447,12 @@ def find_ict_liquidity_raid_setups(
             zone = _compute_zone(last_close, dealing_range, premium_th, discount_th)
             if zone == "discount":
                 continue
+            # 教科书确认:扫荡 BSL 后必须有 bearish 位移(反转推进留下的 FVG)
+            if require_confirmation and not _has_displacement_fvg(
+                candles_1h, "short", since_index=len(candles_1h) - sweep_window_bars,
+                min_height=confirm_min_height_atr * atr_1h,
+            ):
+                continue
             entry = last_close
             sl = window_max_high + sl_atr_mult * atr_1h
             tp = _calc_tp_from_dealing_range(entry_dir, entry, sl, dealing_range)
@@ -416,6 +497,8 @@ def find_ict_mss_retest_setups(
     proximity_atr_mult: float = 0.5,
     sl_atr_mult: float = 1.0,
     min_rr: float = 1.0,
+    require_displacement: bool = True,
+    displacement_min_height_atr: float = 0.25,
 ) -> List[Dict[str, Any]]:
     """HTF MSS + LTF retest setup。
 
@@ -439,6 +522,13 @@ def find_ict_mss_retest_setups(
 
     # HTF bias 必须一致
     if not _check_gates(setup_dir, daily_bias, None):
+        return []
+    # 教科书 ICT:区分 MSS 与普通 CHoCH —— 真 MSS 的突破必须是位移(留下 FVG)。
+    # detect_choch 以最后一根 close 判定突破,所以位移 FVG 应在末尾几根内形成。
+    if require_displacement and not _has_displacement_fvg(
+        candles_4h, setup_dir, since_index=len(candles_4h) - 3,
+        min_height=displacement_min_height_atr * atr_4h,
+    ):
         return []
     # 检查 retest:当前价距 break_price 在 0.5×ATR 内
     if abs(current_price - break_price) > proximity_atr_mult * atr_4h:
