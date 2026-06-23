@@ -70,3 +70,7 @@ class SignalState:
     # source_engine 标识信号来源 engine(TG 前缀 / tracker trail 模式 / 统计分组)。
     # SMC 管线已删除(2026-06-10),现役信号均为 "ict";历史 DB 行可能仍是 "smc"。
     source_engine: str = "ict"
+    # ict_meta:ICT 信号的方法论上下文(供 formatter 渲染 ICT 原生消息)。
+    # 含 daily_bias / zone / zone_pct / sl_basis + 检测器 metadata(leg / pool / displacement)。
+    # 不进 DB 列(insert_signal 逐字段 getattr,忽略此字段);gbrain asdict 可 JSON 序列化。
+    ict_meta: dict = field(default_factory=dict)

@@ -1,7 +1,11 @@
-"""信号消息格式化器。
+"""ICT 信号消息格式化器(2026-06-10 重写,SMC 评分制随管线删除)。
 
-把鸭子类型的 signal 对象 -> Markdown 字符串（Telegram parse_mode='Markdown'）。
-字段通过 getattr 读取，不耦合具体类定义。
+把鸭子类型的 signal 对象 -> Markdown 字符串(Telegram parse_mode='Markdown')。
+字段通过 getattr 读取,不耦合具体类定义。
+
+ICT 信号方法论是 **gate 制**(过 displacement/bias/zone 就发,不打分),所以这里
+不展示评分,改为展示 ICT 真正的上下文:HTF daily bias、premium/discount 分位、
+POI 类型与溯源(leg / pool / 位移确认)。这些来自 SignalState.ict_meta。
 """
 from __future__ import annotations
 
@@ -10,34 +14,21 @@ from typing import Any, Dict, Optional
 
 import pytz
 
-# 评分项中文标签
-SCORE_LABELS: Dict[str, str] = {
-    # 新版(2026-04-20 重构):5 维度,POI 类型 + 订单流信号
-    "C_POI": "POI类型",
-    "C_Vol": "Volume放量",
-    "C_Delta": "Delta强度",
-    "C_Override": "反转SweepOverride",
-    "C_Confluence": "价位共振",
-    # 旧版维度保留显示名(若回测/历史信号带旧 scores,仍能正常展示)
-    "C1": "价位共振",
-    "C2": "Volume放量",
-    "C3": "Delta强度",
-    "C4": "4H结构",
-    "C5": "价量背离",
-    "C6": "长影线",
-    "C7": "价-POC共振",
-    "C8": "OB内含POC",
-    "C9": "扫荡双过",
-    "C10": "反转SweepOverride",
-}
-
-# POI 类型中文
-POI_TYPE_LABELS: Dict[str, str] = {
-    "order_block": "订单块",
-    "fvg": "FVG (公允价值缺口)",
-}
-
 _NY_TZ = pytz.timezone("America/New_York")
+
+# ICT POI 类型中文(key 用 poi_source,如 "ict_ote")
+POI_KIND_LABELS: Dict[str, str] = {
+    "ict_ote": "OTE 最优入场区(62-79% 回撤)",
+    "ict_ob": "订单块 OB(premium/discount)",
+    "ict_liquidity_raid": "流动性扫荡反转(turtle soup)",
+    "ict_mss_retest": "MSS 突破回测",
+}
+
+_BIAS_DISPLAY = {
+    "bullish": "🟢 bullish(只放行 long)",
+    "bearish": "🔴 bearish(只放行 short)",
+    "neutral": "⚪ neutral(两向均可)",
+}
 
 
 def _get(signal: Any, name: str, default: Any = None) -> Any:
@@ -50,15 +41,14 @@ def _get(signal: Any, name: str, default: Any = None) -> Any:
 def _fmt_price(x: Optional[float]) -> str:
     if x is None:
         return "-"
-    return f"{x:.2f}"
+    return f"{float(x):.2f}"
 
 
 def _fmt_ts_et(ts: Optional[int]) -> str:
-    """把 created_at（Unix 秒或毫秒）转为 'YYYY-MM-DD HH:MM ET'。"""
+    """把 created_at(Unix 秒或毫秒)转为 'YYYY-MM-DD HH:MM ET'。"""
     if ts is None:
         return "-"
-    # 自动判断秒/毫秒：> 1e12 认为是毫秒
-    if ts > 10_000_000_000:
+    if ts > 10_000_000_000:  # > 1e12 视为毫秒
         ts = ts / 1000.0
     try:
         dt = datetime.fromtimestamp(float(ts), tz=pytz.utc).astimezone(_NY_TZ)
@@ -67,51 +57,8 @@ def _fmt_ts_et(ts: Optional[int]) -> str:
         return "-"
 
 
-def _pct(target: Optional[float], entry: Optional[float]) -> str:
-    """计算 (target - entry) / entry 的百分比，带正负号。"""
-    if target is None or entry is None or entry == 0:
-        return ""
-    pct = (target - entry) / entry * 100.0
-    sign = "+" if pct >= 0 else ""
-    return f"{sign}{pct:.2f}%"
-
-
-def _format_sweep(sweep: Optional[Dict[str, Any]]) -> str:
-    """格式化流动性猎取信息。"""
-    if not sweep:
-        return "未检测"
-    ratio = sweep.get("wick_body_ratio") if isinstance(sweep, dict) else None
-    direction = sweep.get("direction") if isinstance(sweep, dict) else None
-    label = "长影线"
-    if direction == "upper":
-        label = "长上影线"
-    elif direction == "lower":
-        label = "长下影线"
-    if ratio is not None:
-        return f"✅ {label} (影线/实体 = {float(ratio):.1f}x)"
-    return f"✅ {label}"
-
-
-def _format_poi(poi_type: Optional[str], poi_low: Optional[float], poi_high: Optional[float]) -> str:
-    if not poi_type:
-        return "-"
-    label = POI_TYPE_LABELS.get(poi_type, poi_type)
-    if poi_low is not None and poi_high is not None:
-        return f"{label} [{_fmt_price(poi_low)} - {_fmt_price(poi_high)}]"
-    return label
-
-
-def _format_triggered_level(level: Optional[str], level_value: Optional[float]) -> str:
-    """展示触发价位名 + 实际价(优先用 level_value,无则留空)。"""
-    if not level:
-        return "-"
-    if level_value is not None:
-        return f"{level} @ {_fmt_price(level_value)}"
-    return level
-
-
 def _fmt_ms_et(ms: Optional[int]) -> str:
-    """Binance open_time 是毫秒,格式化为 'MM-DD HH:MM ET'。"""
+    """毫秒时间戳 -> 'MM-DD HH:MM ET'。"""
     if ms is None:
         return "-"
     try:
@@ -121,155 +68,146 @@ def _fmt_ms_et(ms: Optional[int]) -> str:
         return "-"
 
 
-def _format_evidence(signal: Any) -> str:
-    """溯源证据区块:展示原始 K 线时间/价位,便于回 TradingView 对图复盘。"""
-    lines: list[str] = []
-
-    sweep = _get(signal, "liquidity_sweep_candle")
-    if isinstance(sweep, dict):
-        t = sweep.get("time")
-        hi, lo = sweep.get("high"), sweep.get("low")
-        delta = _get(signal, "sweep_bar_delta")
-        delta_str = f"  Δ={delta:+.1f}" if isinstance(delta, (int, float)) else ""
-        lines.append(
-            f"• 猎杀 K 线: {_fmt_ms_et(t)}  H={_fmt_price(hi)} L={_fmt_price(lo)}{delta_str}"
-        )
-
-    poi_origin = _get(signal, "poi_origin_time")
-    disp_t = _get(signal, "poi_displacement_time")
-    disp_mult = _get(signal, "poi_displacement_mult")
-    poi_type = _get(signal, "poi_type") or ""
-    if poi_origin is not None:
-        if "ob" in poi_type and disp_t is not None:
-            mult_str = f"  位移 body×{disp_mult:.2f}" if isinstance(disp_mult, (int, float)) else ""
-            lines.append(
-                f"• OB 原 K: {_fmt_ms_et(poi_origin)}  →  位移 K: {_fmt_ms_et(disp_t)}{mult_str}"
-            )
-        else:
-            lines.append(f"• POI K 线: {_fmt_ms_et(poi_origin)}")
-
-    vp_poc = _get(signal, "poi_vp_poc")
-    if isinstance(vp_poc, (int, float)):
-        lines.append(f"• VP POC 支撑: {_fmt_price(vp_poc)}")
-
-    ch_price = _get(signal, "choch_break_price")
-    ch_time = _get(signal, "choch_break_time")
-    if ch_price is not None or ch_time is not None:
-        lines.append(
-            f"• CHoCH 破位: {_fmt_price(ch_price)} @ {_fmt_ms_et(ch_time)}"
-        )
-
-    return "\n".join(lines) if lines else "(无证据记录)"
+def _pct(target: Optional[float], entry: Optional[float]) -> str:
+    """计算 (target - entry) / entry 的百分比,带正负号。"""
+    if target is None or entry is None or entry == 0:
+        return ""
+    pct = (target - entry) / entry * 100.0
+    sign = "+" if pct >= 0 else ""
+    return f"{sign}{pct:.2f}%"
 
 
-def _format_scores(scores: Optional[Dict[str, float]]) -> str:
-    """只展示触发了的（非 0）条件。"""
-    if not scores:
-        return "(无评分明细)"
-    lines = []
-    # 固定顺序 C1..C7，保证输出稳定
-    for key in sorted(scores.keys(), key=lambda k: (k[0], k[1:])):
-        val = scores.get(key, 0)
-        try:
-            val_f = float(val)
-        except (TypeError, ValueError):
-            continue
-        if val_f == 0:
-            continue
-        label = SCORE_LABELS.get(key, key)
-        sign = "+" if val_f >= 0 else ""
-        # 尽量用整数展示
-        val_str = f"{int(val_f)}" if val_f.is_integer() else f"{val_f:g}"
-        lines.append(f"{key} {label} {sign}{val_str}")
-    return "\n".join(lines) if lines else "(无评分明细)"
+def _poi_kind(signal: Any, meta: Dict[str, Any]) -> str:
+    """取干净的 POI 类型 key(ict_ote / ict_ob / ...)。"""
+    return meta.get("poi_kind") or _get(signal, "poi_source") or ""
+
+
+def _format_htf_context(meta: Dict[str, Any]) -> list:
+    """ICT HTF 背景:daily bias + premium/discount 分位 + 位移确认。"""
+    lines: list = []
+    bias = meta.get("daily_bias")
+    if bias:
+        lines.append(f"• Daily bias: {_BIAS_DISPLAY.get(bias, bias)}")
+    zone_pct = meta.get("zone_pct")
+    zone = meta.get("zone")
+    if isinstance(zone_pct, (int, float)):
+        zone_cn = {"premium": "premium 区", "discount": "discount 区",
+                   "equilibrium": "均衡区"}.get(zone, zone or "")
+        lines.append(f"• Dealing range 分位: {zone_pct*100:.0f}%({zone_cn})")
+    # 位移确认(OB / raid / mss 才有意义)
+    disp = meta.get("displacement_mult") or meta.get("displacement_body_mult")
+    if isinstance(disp, (int, float)):
+        lines.append(f"• 位移确认: ✅ body×{disp:.2f}")
+    return lines
+
+
+def _format_source_evidence(kind: str, meta: Dict[str, Any]) -> list:
+    """按 POI 类型展示溯源(回图核对用)。"""
+    lines: list = []
+    if kind == "ict_ote":
+        ls, le = meta.get("leg_start"), meta.get("leg_end")
+        rp = meta.get("retracement_pct")
+        if ls is not None and le is not None:
+            rp_str = f"(回撤 {rp*100:.0f}%)" if isinstance(rp, (int, float)) else ""
+            lines.append(f"• OTE leg: {_fmt_price(ls)} → {_fmt_price(le)} {rp_str}")
+        if meta.get("leg_end_time"):
+            lines.append(f"• leg 终点 K: {_fmt_ms_et(meta.get('leg_end_time'))}")
+    elif kind == "ict_ob":
+        if meta.get("ob_time"):
+            lines.append(f"• OB 原 K: {_fmt_ms_et(meta.get('ob_time'))}")
+        if meta.get("ob_zone"):
+            lines.append(f"• OB 落区: {meta.get('ob_zone')}")
+    elif kind == "ict_liquidity_raid":
+        pool = meta.get("pool_type")
+        if pool:
+            pool_cn = {"SSL": "等低点(SSL)", "BSL": "等高点(BSL)"}.get(pool, pool)
+            lines.append(f"• 扫荡池: {pool_cn}  触点×{meta.get('touches', '?')}")
+        if meta.get("sweep_extreme") is not None:
+            lines.append(f"• 扫荡极值: {_fmt_price(meta.get('sweep_extreme'))}")
+        if meta.get("sweep_bar_time"):
+            lines.append(f"• 扫荡 K: {_fmt_ms_et(meta.get('sweep_bar_time'))}")
+    elif kind == "ict_mss_retest":
+        if meta.get("break_price") is not None:
+            lines.append(f"• MSS 突破价: {_fmt_price(meta.get('break_price'))}")
+        if meta.get("break_time"):
+            lines.append(f"• MSS 突破 K: {_fmt_ms_et(meta.get('break_time'))}")
+    return lines
 
 
 def format_signal(signal: Any) -> str:
-    """把 signal 对象格式化成 Markdown 消息。"""
+    """把 ICT signal 对象格式化成 Markdown 消息。"""
     direction = (_get(signal, "direction") or "").lower()
     is_long = direction == "long"
     emoji = "🟢" if is_long else "🔴"
     direction_cn = "做多信号" if is_long else "做空信号"
+    dir_cn_short = "做多" if is_long else "做空"
 
     symbol = _get(signal, "symbol", "?")
-    total_score = _get(signal, "total_score", 0)
-    try:
-        score_str = f"{float(total_score):g}"
-    except (TypeError, ValueError):
-        score_str = str(total_score)
+    meta = _get(signal, "ict_meta") or {}
+    kind = _poi_kind(signal, meta)
+    kind_label = POI_KIND_LABELS.get(kind, kind or "ICT setup")
 
-    triggered_level = _get(signal, "triggered_level")
-    triggered_level_value = _get(signal, "triggered_level_value")
     entry_price = _get(signal, "entry_price")
     stop_loss = _get(signal, "stop_loss")
     take_profit = _get(signal, "take_profit")
     risk_reward = _get(signal, "risk_reward")
-    poi_type = _get(signal, "poi_type")
     poi_low = _get(signal, "poi_low")
     poi_high = _get(signal, "poi_high")
     created_at = _get(signal, "created_at")
-    sweep = _get(signal, "liquidity_sweep_candle")
-    scores = _get(signal, "scores") or {}
 
-    # 2026-05-24:入场模式
-    #   limit     - POI 边界外侧 buffer 挂单,等价格回测才成交
-    #   immediate - IFVG / fallback,立即按 entry 入场
     entry_mode = (_get(signal, "entry_mode") or "limit").lower()
     is_limit = (entry_mode == "limit")
-    dir_cn_short = "做空" if not is_long else "做多"
 
-    trade_lines = ["💰 交易参数:"]
+    # ---- 入场区块 ----
+    trade_lines = ["📊 入场:"]
     if is_limit:
-        trade_lines.append(
-            f"• 📋 挂单{dir_cn_short} @ {_fmt_price(entry_price)}(等价格回测此位成交)"
-        )
+        trade_lines.append(f"• 📋 挂单{dir_cn_short} @ {_fmt_price(entry_price)}(等价格回测此位成交)")
     else:
-        trade_lines.append(f"• 入场价: {_fmt_price(entry_price)}")
-    # SL / TP / RR 都由用户手动决定,仅当信号里真的带了才展示(当前正常路径下都为 None)
+        trade_lines.append(f"• 市价{dir_cn_short} @ {_fmt_price(entry_price)}(价格已在位)")
+    if poi_low is not None and poi_high is not None:
+        trade_lines.append(f"• POI 区间: {_fmt_price(poi_low)} - {_fmt_price(poi_high)}")
     if stop_loss is not None:
         sl_pct = _pct(stop_loss, entry_price)
-        trade_lines.append(f"• 止损价: {_fmt_price(stop_loss)}" + (f"  ({sl_pct})" if sl_pct else ""))
+        basis = meta.get("sl_basis")
+        basis_str = f" — {basis}" if basis else ""
+        trade_lines.append(f"• 止损价: {_fmt_price(stop_loss)}" + (f"  ({sl_pct})" if sl_pct else "") + basis_str)
     if take_profit is not None:
         tp_pct = _pct(take_profit, entry_price)
-        trade_lines.append(f"• 目标价: {_fmt_price(take_profit)}" + (f"  ({tp_pct})" if tp_pct else ""))
+        trade_lines.append(f"• 目标价: {_fmt_price(take_profit)}" + (f"  ({tp_pct})" if tp_pct else "") + " — dealing range 对侧")
     if risk_reward is not None:
         try:
             trade_lines.append(f"• 盈亏比: 1:{float(risk_reward):.1f}")
         except (TypeError, ValueError):
             pass
-    # 2026-04-23:推送 TP1 + trail 指引(bot 追踪器会在 TP1/TP2/SL 命中时继续发提醒)
+
+    # ---- 仓位管理 ----
+    pos_lines = ["🎯 仓位管理:"]
     if take_profit is not None and entry_price is not None and stop_loss is not None:
-        trade_lines.append(f"• TP1(建议平 50%): {_fmt_price(take_profit)}")
-        trade_lines.append("• TP2(剩余 50%): 达 TP1 后启用 peak − 1.5×ATR_4h 移动止盈")
+        pos_lines.append(f"• TP1(建议平 50%): {_fmt_price(take_profit)}")
+        pos_lines.append("• TP2(剩余 50%): 达 TP1 后 peak ∓ 1.5×ATR_4h 移动止盈")
         if is_limit:
-            trade_lines.append("• bot 会在 limit 成交 / TP1 / TP2 / SL 命中时发 TG 提醒")
-            trade_lines.append("• ⏱️ Limit 24h 未成交 → 自动作废")
+            pos_lines.append("• bot 会在 limit 成交 / TP1 / TP2 / SL 命中时发 TG 提醒")
+            pos_lines.append("• ⏱️ Limit 24h 未成交 → 自动作废")
         else:
-            trade_lines.append("• bot 会在 TP1 / TP2 / SL 命中时发 TG 提醒")
+            pos_lines.append("• bot 会在 TP1 / TP2 / SL 命中时发 TG 提醒")
     else:
-        trade_lines.append("• 止损 / 目标由你自行判断")
+        pos_lines.append("• 止损 / 目标由你自行判断")
+
+    htf = _format_htf_context(meta)
+    evidence = _format_source_evidence(kind, meta)
 
     lines = [
-        f"{emoji} {direction_cn} | {symbol} | 评分: {score_str}/10",
+        f"{emoji} {direction_cn} | {symbol}",
+        f"ICT · {kind_label}",
+        f"🕐 {_fmt_ts_et(created_at)}",
         "",
-        f"📍 触发价位: {_format_triggered_level(triggered_level, triggered_level_value)}",
-        f"🕐 时间: {_fmt_ts_et(created_at)}",
-        "",
-        "📊 信号详情:",
-        f"• 流动性猎取: {_format_sweep(sweep)}",
-        f"• POI 类型: {_format_poi(poi_type, poi_low, poi_high)}",
-        "• 止损依据: POI 对侧边界 + 0.15×ATR_4h 缓冲",
-        "",
-        *trade_lines,
-        "",
-        "🔍 证据溯源 (回图可核对):",
-        _format_evidence(signal),
-        "",
-        "📈 评分明细:",
-        _format_scores(scores),
-        "",
-        "⚠️ 仅供参考，人工确认后再入场",
     ]
+    if htf:
+        lines += ["🧭 HTF 背景:", *htf, ""]
+    lines += [*trade_lines, "", *pos_lines]
+    if evidence:
+        lines += ["", "🔍 溯源(回图核对):", *evidence]
+    lines += ["", "⚠️ 仅供参考,人工确认后再入场"]
     return "\n".join(lines)
 
 

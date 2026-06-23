@@ -356,6 +356,22 @@ class ICTSignalEngine:
             self._diag[f"{poi_type}_h4_bias_veto_short"] += 1
             logger.info(f"[ICT-{poi_type}] {direction} 被 4h_bias=bullish 否决(entry={entry:.2f})")
             return None
+        # ICT 方法论上下文(供 formatter 渲染 ICT 原生消息)
+        _SL_BASIS = {
+            "ict_ob": "OB 对侧极值 ±0.3×ATR",
+            "ict_ote": "leg 起点(0% 回撤)±0.3×ATR",
+            "ict_liquidity_raid": "扫荡极值 ±0.3×ATR",
+            "ict_mss_retest": "MSS 突破价 ±1.0×ATR",
+        }
+        dr_now = self._build_dealing_range(symbol)
+        ict_meta = {
+            "poi_kind": poi_type,
+            "daily_bias": self._check_daily_bias(symbol),
+            "zone": price_zone(entry, dr_now, self.premium_threshold, self.discount_threshold) if dr_now else None,
+            "zone_pct": price_zone_pct(entry, dr_now),
+            "sl_basis": _SL_BASIS.get(poi_type, ""),
+            **meta,
+        }
         sid = str(uuid.uuid4())
         now = self._now()
         self.active_signals[sid] = SignalState(
@@ -383,6 +399,7 @@ class ICTSignalEngine:
             expires_at=now + self.signal_ttl,
             notification_sent=False,
             source_engine="ict",
+            ict_meta=ict_meta,
         )
         self._emitted_origins.add((poi_type, direction, poi_origin))
         self._diag[f"{poi_type}_created"] += 1
