@@ -4,9 +4,8 @@
 - 外发:`send_signal(s)` 将 SignalState 格式化后推送到 Telegram
 - 入站命令(仅 chat_id 匹配的 message 响应,其余忽略):
     /signals [hours]  查近 N 小时 notified 信号,默认 6,limit 20
-    /active           列当前 in-flight 信号(Step1~STEP6)
-    /status           bot 状态:最近 1h close 时间、in-flight 计数
-    /help             帮助
+    /status           bot 状态:最近 1h close 时间
+    /snapshot         盘面快照(多级别 S/R + bias)
 - 所有失败记 error log,不抛出
 - 支持可选 SOCKS5/HTTP 代理
 """
@@ -41,9 +40,7 @@ _BTN_HEARTBEAT = "🫀 心跳"
 _BTN_SNAPSHOT = "📈 盘面"
 _BTN_24H = "📊 近 24h"
 _BTN_3D = "📊 近 3 天"
-_BTN_ACTIVE = "⏳ in-flight"
 _BTN_STATUS = "🔧 状态"
-_BTN_HELP = "❓ 帮助"
 
 
 def _build_reply_keyboard() -> Any:
@@ -53,8 +50,7 @@ def _build_reply_keyboard() -> Any:
     return ReplyKeyboardMarkup(
         [
             [KeyboardButton(_BTN_HEARTBEAT), KeyboardButton(_BTN_SNAPSHOT), KeyboardButton(_BTN_STATUS)],
-            [KeyboardButton(_BTN_24H), KeyboardButton(_BTN_3D), KeyboardButton(_BTN_ACTIVE)],
-            [KeyboardButton(_BTN_HELP)],
+            [KeyboardButton(_BTN_24H), KeyboardButton(_BTN_3D)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -112,13 +108,10 @@ class TelegramNotifier:
         # 注册命令 + 按钮 handler:仅当 db/engine 至少有一个注入时开启入站
         if CommandHandler is not None and (self._db is not None or self._engine is not None):
             self._app.add_handler(CommandHandler("signals", self._cmd_signals))
-            self._app.add_handler(CommandHandler("active", self._cmd_active))
             self._app.add_handler(CommandHandler("status", self._cmd_status))
             self._app.add_handler(CommandHandler("snapshot", self._cmd_snapshot))
             self._app.add_handler(CommandHandler("close", self._cmd_close))
             self._app.add_handler(CommandHandler("ask", self._cmd_ask))
-            self._app.add_handler(CommandHandler("help", self._cmd_help))
-            self._app.add_handler(CommandHandler("start", self._cmd_help))
             # 文本按钮(ReplyKeyboard 点击后发来的是纯文本)
             if MessageHandler is not None and filters is not None:
                 self._app.add_handler(
@@ -295,36 +288,6 @@ class TelegramNotifier:
                 f"{_html_escape(srcs)}{dup_str}\n"
                 f"  E={_num(entry)} SL={_num(sl)} TP={_num(tp)}  "
                 f"RR={_num(rr)}  score={score:.1f}  [{_html_escape(outcome)}]{pnl_str}"
-            )
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-
-    async def _cmd_active(self, update: Any, context: Any) -> None:
-        if not self._is_authorized(update):
-            return
-        if self._engine is None:
-            await update.message.reply_text("engine 未接入,无法查询")
-            return
-        active = getattr(self._engine, "active_signals", {}) or {}
-        in_flight = []
-        for sid, s in active.items():
-            step = getattr(s.step, "value", str(s.step))
-            if step in ("NOTIFIED", "EXPIRED", "INVALIDATED"):
-                continue
-            in_flight.append((sid, s, step))
-        if not in_flight:
-            await update.message.reply_text("当前无 in-flight 信号")
-            return
-        lines = [f"<b>in-flight 信号</b> ({len(in_flight)} 条)\n"]
-        for sid, s, step in in_flight[:20]:
-            poi_src = getattr(s, "poi_source", None) or "-"
-            direction = getattr(s, "direction", "?")
-            poi_low = getattr(s, "poi_low", None)
-            poi_high = getattr(s, "poi_high", None)
-            poi_range = f"[{poi_low}-{poi_high}]" if poi_low is not None else "-"
-            lines.append(
-                f"<code>{_html_escape(sid[:8])}</code> {_html_escape(direction)} "
-                f"{_html_escape(step)}\n"
-                f"  src={_html_escape(poi_src)}  POI={_html_escape(poi_range)}"
             )
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -565,24 +528,6 @@ class TelegramNotifier:
                 f"({closed.direction} entry={closed.entry:.2f})"
             )
 
-    async def _cmd_help(self, update: Any, context: Any) -> None:
-        if not self._is_authorized(update):
-            return
-        kb = _build_reply_keyboard()
-        await update.message.reply_text(
-            "<b>ICT Bot 命令</b>\n\n"
-            "👇 <b>点下方按钮</b>(推荐) 或输入 /命令\n\n"
-            "<code>/signals [小时]</code>  查近 N 小时(默认 6,最多 168)\n"
-            "<code>/active</code>          当前 in-flight 信号\n"
-            "<code>/status</code>          Bot 状态 + 最近 K 线时间\n"
-            "<code>/snapshot</code>        盘面快照(多级别结构 + bias + 流动性池)\n"
-            "<code>/close &lt;sid&gt;</code>   手动关闭一个 tracker(不再监控 TP/SL)\n"
-            "<code>/ask &lt;问题&gt;</code>   问 Claude 任何问题(查/改/部署 bot)\n"
-            "<code>/help</code>            显示帮助",
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
-
     async def _cmd_heartbeat(self, update: Any, context: Any) -> None:
         """ICT bot 心跳:推一条与定时心跳完全相同的状态消息。
         依赖 main.py 在初始化时把 build_heartbeat_text 注入 self.heartbeat_text_builder。
@@ -642,12 +587,8 @@ class TelegramNotifier:
         elif _BTN_3D in text:
             context.args = ["72"]
             await self._cmd_signals(update, context)
-        elif _BTN_ACTIVE in text:
-            await self._cmd_active(update, context)
         elif _BTN_STATUS in text:
             await self._cmd_status(update, context)
-        elif _BTN_HELP in text:
-            await self._cmd_help(update, context)
         # 其它文本:沉默忽略(别人发别的话也不响应)
 
 

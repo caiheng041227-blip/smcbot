@@ -218,7 +218,7 @@ async def main_async() -> None:
         tracker.notifier = notifier  # 双向绑定,让 tracker 能发 TG 提醒
         await notifier.send_text(
             "🤖 ICT Bot 已启动，开始监控 ETHUSDT\n\n"
-            "👇 点下方按钮查询,或输入 /help 看命令",
+            "👇 点下方按钮查询(心跳 / 盘面 / 状态 / 近24h / 近3天)",
             with_keyboard=True,
         )
     else:
