@@ -331,19 +331,20 @@ async def main_async() -> None:
         return "\n".join(lines)
 
     def _cluster_levels(prices: list, tol: float, maxwidth: float) -> list:
-        """把临近的 swing 价位聚成区间。返回 [(lo, hi), ...] 按价升序。
+        """把临近的 swing 价位聚成区间。返回 [(lo, hi, n), ...],n=区间内被测试次数。
         tol:相邻两点合并的最大间距;maxwidth:单个区间封顶宽度(防一串 swing 链成大坨)。"""
         if not prices:
             return []
         ps = sorted(prices)
-        clusters = [[ps[0], ps[0]]]
+        clusters = [[ps[0], ps[0], 1]]
         for p in ps[1:]:
-            lo, hi = clusters[-1]
+            lo, hi, n = clusters[-1]
             if p - hi <= tol and p - lo <= maxwidth:
                 clusters[-1][1] = p
+                clusters[-1][2] = n + 1
             else:
-                clusters.append([p, p])
-        return [(lo, hi) for lo, hi in clusters]
+                clusters.append([p, p, 1])
+        return [(lo, hi, n) for lo, hi, n in clusters]
 
     def _fmt_level(lo: float, hi: float) -> str:
         """单点显示一个数,成区间显示 lo-hi。"""
@@ -351,9 +352,54 @@ async def main_async() -> None:
             return f"{lo:.0f}"
         return f"{lo:.0f}-{hi:.0f}"
 
+    def _atr_of(bars: list, n: int = 14) -> float:
+        """对任意 dict/Candle 列表算 ATR(快照各级别共用)。"""
+        if len(bars) < n + 2:
+            return 0.0
+        def _h(c): return c["high"] if isinstance(c, dict) else c.high
+        def _l(c): return c["low"] if isinstance(c, dict) else c.low
+        def _c(c): return c["close"] if isinstance(c, dict) else c.close
+        trs = [max(_h(x) - _l(x), abs(_h(x) - _c(bars[i-1])), abs(_l(x) - _c(bars[i-1])))
+               for i, x in enumerate(bars[1:], 1)]
+        s = sum(trs[:n]) / n
+        for t in trs[n:]:
+            s = (s * (n - 1) + t) / n
+        return s
+
+    def _vol_profile(bars: list, nbuckets: int = 80) -> Optional[tuple]:
+        """从 OHLCV 建价格→成交量直方图。每根成交量记入其典型价(hlc/3)所在桶。
+        返回 (buckets dict, bucket_size, lo) 或 None。"""
+        def g(c, k): return c[k] if isinstance(c, dict) else getattr(c, k)
+        if not bars:
+            return None
+        lo = min(g(c, "low") for c in bars)
+        hi = max(g(c, "high") for c in bars)
+        if hi <= lo:
+            return None
+        bsize = (hi - lo) / nbuckets
+        buckets: dict = {}
+        for c in bars:
+            tp = (g(c, "high") + g(c, "low") + g(c, "close")) / 3
+            idx = int((tp - lo) / bsize)
+            buckets[idx] = buckets.get(idx, 0.0) + float(g(c, "volume"))
+        return buckets, bsize, lo
+
+    def _vol_confirmed(price: float, vp: Optional[tuple]) -> bool:
+        """price 所在桶(±1)的成交量是否落在 top 30%(= 成交密集区)。"""
+        if not vp:
+            return False
+        buckets, bsize, lo = vp
+        if len(buckets) < 5 or bsize <= 0:
+            return False
+        vols = sorted(buckets.values())
+        thr = vols[int(len(vols) * 0.7)]   # 70 分位线
+        idx = int((price - lo) / bsize)
+        local = sum(buckets.get(idx + d, 0.0) for d in (-1, 0, 1))
+        return local >= thr and thr > 0
+
     async def build_snapshot_text() -> str:
         """像博主那样列各级别支撑/阻力位 —— 用结构性 swing 高低点(客观 S/R),
-        临近的自动聚成区间。不预测走势。"""
+        临近的自动聚成区间。周线现拉 OKX(bot 不订阅周线);日线/4H 用内存。不预测。"""
         from engine.market_structure import find_swing_points_atr
 
         emoji_map = {"bullish": "🟢 偏多", "bearish": "🔴 偏空", "neutral": "⚪ 震荡", "?": "❓"}
@@ -370,28 +416,66 @@ async def main_async() -> None:
             "━━━━━━━━━━━━━━━",
         ]
 
-        # 各级别:swing 高低点 → 现价上方=阻力 / 下方=支撑,聚区间,各取最近 3 档
-        TF_PLAN = [("1d", "日线", 120), ("4h", "4H", 200), ("1h", "1H", 150)]
-        for tf, label, win_n in TF_PLAN:
-            win = candles.window(symbol, tf, win_n)
-            if len(win) < 13:
-                continue
-            atr_v = ict_engine._atr(symbol, tf)
-            if atr_v <= 0:
-                continue
-            highs, lows = find_swing_points_atr(list(win), atr_v, 1.0)
-            trend = classify_structure_atr(list(win), atr_v, 1.0)
-            pivots = [float(h["price"]) for h in highs] + [float(l["price"]) for l in lows]
-            tol = max(px * 0.003, atr_v * 0.3)   # 相邻合并间距:0.3% 或 0.3×ATR 取大
-            mw = px * 0.012                      # 单区间封顶宽度 ≈1.2%,防 swing 链成大坨
-            res = _cluster_levels([p for p in pivots if p > px], tol, mw)[:3]          # 阻力:近→远
-            sup = list(reversed(_cluster_levels([p for p in pivots if p < px], tol, mw)))[:3]  # 支撑:近→远
-            if not res and not sup:
-                continue
+        def _best(clusters: list) -> Optional[tuple]:
+            """挑最靠谱的一档:离现价最近(=下一个会碰到的位),测试次数仅作可靠度标注。
+            (纯按测试次数排会surface 离现价很远、短期碰不到的位,反而没用。)"""
+            if not clusters:
+                return None
+            return sorted(clusters, key=lambda c: abs((c[0] + c[1]) / 2 - px))[0]
+
+        def _fmt_best(c: Optional[tuple], empty: str) -> str:
+            if c is None:
+                return empty
+            lo, hi, n = c
+            touch = f" ({n}次测试)" if n >= 2 else ""
+            return _fmt_level(lo, hi) + touch
+
+        def _sr_block(label: str, bars: list, atr_v: float, min_move: float) -> None:
+            """算一个级别**最靠谱的 1 档** S/R 并追加到 lines。bars: dict/Candle 列表。
+
+            min_move 调大(4h/日线 2.0、周线 1.5)只留主结构 swing,滤掉小波动;
+            sep 剔除贴现价(0.8% 内)的位 —— 那些不是有效 S/R,价格已经在那。
+            """
+            if len(bars) < 13 or atr_v <= 0:
+                return
+            highs, lows = find_swing_points_atr(bars, atr_v, min_move)
+            trend = classify_structure_atr(bars, atr_v, min_move)
+            # 阻力 = 现价上方的 swing **高点**(峰);支撑 = 下方的 swing **低点**(谷)。
+            # 不混入"被跌破的旧支撑/旧阻力"(那是极性翻转,概念上更绕,且常贴现价)。
+            high_p = [float(h["price"]) for h in highs]
+            low_p = [float(l["price"]) for l in lows]
+            sep = px * 0.008                     # 最小间距:剔除贴现价 0.8% 内的微小波动
+            tol = max(px * 0.003, atr_v * 0.3)   # 相邻合并间距
+            mw = px * 0.012                      # 单区间封顶宽度 ≈1.2%
+            res = _best(_cluster_levels([p for p in high_p if p > px + sep], tol, mw))
+            sup = _best(_cluster_levels([p for p in low_p if p < px - sep], tol, mw))
+            if res is None and sup is None:
+                return
+            vp = _vol_profile(bars)   # 成交量确认:落在成交密集区的位标 ⭐
+
+            def _star(c) -> str:
+                return " ⭐成交密集" if c is not None and _vol_confirmed((c[0] + c[1]) / 2, vp) else ""
+
             lines.append(f"【{label}级别】 {emoji_map.get(trend, '❓')}")
-            lines.append("  🔴 阻力: " + ("  ".join(_fmt_level(lo, hi) for lo, hi in res) or "—(上方无结构)"))
-            lines.append("  🟢 支撑: " + ("  ".join(_fmt_level(lo, hi) for lo, hi in sup) or "—(下方无结构)"))
+            lines.append("  🔴 阻力: " + _fmt_best(res, "—(上方无结构)") + _star(res))
+            lines.append("  🟢 支撑: " + _fmt_best(sup, "—(下方无结构)") + _star(sup))
             lines.append("")
+
+        # 周线:bot 不订阅,现拉 OKX 深历史(~2 年)
+        try:
+            wk_rows = await fetch_klines(symbol, "1w", 104, proxy=bf_proxy, exchange=exchange)
+            wk = [{"open": float(r["o"]), "high": float(r["h"]), "low": float(r["l"]),
+                   "close": float(r["c"]), "volume": float(r["v"]), "open_time": int(r["t"])}
+                  for r in wk_rows]
+            wk.sort(key=lambda c: c["open_time"])
+            _sr_block("周线", wk, _atr_of(wk), 1.5)   # 周线 bar 少,1.5 已够主结构
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"snapshot 周线拉取失败: {e}")
+
+        # 日线 / 4H:用内存(closed_only,剔除当日未收盘 bar);min_move=2.0 只留主结构位
+        for tf, label, win_n in [("1d", "日线", 120), ("4h", "4H", 200)]:
+            win = candles.window(symbol, tf, win_n, closed_only=True)
+            _sr_block(label, list(win), ict_engine._atr(symbol, tf, closed_only=True), 2.0)
 
         # ICT bias(决定 bot 当前只发哪个方向的信号)
         try:
@@ -401,7 +485,7 @@ async def main_async() -> None:
         bias_note = {"bullish": "bot 当前只发 long", "bearish": "bot 当前只发 short",
                      "neutral": "bot 两向均可", "?": "数据不足"}.get(bias, "")
         lines.append(f"🧭 ICT bias: {emoji_map.get(bias, '❓')} — {bias_note}")
-        lines += ["", "⚠️ 客观 swing 高低点,非预测;价格接近时才是真支撑/阻力"]
+        lines += ["", "⚠️ 客观 swing 高低点;⭐=落在成交密集区(更强);非预测,接近时才是真位"]
         return "\n".join(lines)
 
     async def heartbeat_loop():
