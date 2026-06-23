@@ -126,8 +126,8 @@ class ICTSignalEngine:
             self._current_time_sec = int(ct_ms / 1000)
 
     # ---- ATR 计算(复用 candles)----
-    def _atr(self, symbol: str, tf: str, period: int = 14) -> float:
-        candles = self.candles.window(symbol, tf, period + 5)
+    def _atr(self, symbol: str, tf: str, period: int = 14, closed_only: bool = False) -> float:
+        candles = self.candles.window(symbol, tf, period + 5, closed_only=closed_only)
         if len(candles) < period + 1:
             return 0.0
         trs: List[float] = []
@@ -201,20 +201,32 @@ class ICTSignalEngine:
 
     # ---- HTF gates ----
     def _check_daily_bias(self, symbol: str) -> Optional[str]:
-        """返回 'bullish' / 'bearish' / 'neutral' / None(数据不足)。"""
+        """返回 'bullish' / 'bearish' / 'neutral' / None(数据不足)。
+
+        2026-06-23:**只用已收盘日线**(closed_only)。原先 window 带着当日未收盘的
+        forming bar,其 OHLC 随市价实时变动 → bias 盘中乱翻,且与回测(只喂收盘 K)不一致。
+        closed_only 让 live 与回测对齐;回测无 forming bar,故回测结果不变。
+        """
         if not self.daily_bias_enabled:
             return None
-        d1 = self.candles.window(symbol, "1d", max(self.daily_bias_lookback + 5, 35))
+        d1 = self.candles.window(symbol, "1d", max(self.daily_bias_lookback + 5, 35),
+                                 closed_only=True)
         if len(d1) < 10:
             return None
-        atr_1d = self._atr(symbol, "1d")
+        atr_1d = self._atr(symbol, "1d", closed_only=True)
         if atr_1d <= 0:
             return None
-        return detect_daily_bias(
+        bias = detect_daily_bias(
             d1, atr_1d,
             lookback=self.daily_bias_lookback,
             min_move_mult=self.daily_bias_min_move,
         )
+        # 临时诊断(确认修复后删):dump bias 计算输入
+        logger.info(
+            f"[BIAS-DEBUG] n={len(d1)} last3={[(int(c.open_time), round(c.close, 1)) for c in d1[-3:]]} "
+            f"atr1d={atr_1d:.2f} bias={bias}"
+        )
+        return bias
 
     def _check_h4_bias(self, symbol: str) -> Optional[str]:
         """4h ATR pivot 结构判定(daily MSS 滞后时的早期预警)。

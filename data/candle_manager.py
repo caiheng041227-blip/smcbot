@@ -76,8 +76,14 @@ class CandleManager:
                 return c
         return None
 
-    def window(self, symbol: str, timeframe: str, n: int) -> List[Candle]:
+    def window(self, symbol: str, timeframe: str, n: int,
+               closed_only: bool = False) -> List[Candle]:
+        """返回最近 n 根。closed_only=True 时剔除尾部未闭合的活 bar
+        (活 bar 的 OHLC 随市价实时变动,会让 bias/结构判定盘中乱翻)。"""
         dq = self._store.get((symbol, timeframe))
         if not dq:
             return []
-        return list(dq)[-n:]
+        bars = list(dq)
+        if closed_only and bars and not bars[-1].closed:
+            bars = bars[:-1]
+        return bars[-n:]
