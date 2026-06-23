@@ -315,10 +315,12 @@ class Database:
         """
         assert self._conn is not None
         cutoff = int(time.time()) - hours * 3600
+        # 排除 voided(replay 幽灵等被作废的信号)—— 不是真交易机会,不进 /signals
+        _not_voided = "AND COALESCE(outcome,'') != 'voided' "
         if include_scored:
-            where = "WHERE COALESCE(notified_at, scored_at) >= ? "
+            where = "WHERE COALESCE(notified_at, scored_at) >= ? " + _not_voided
         else:
-            where = "WHERE notified_at >= ? "
+            where = "WHERE notified_at >= ? " + _not_voided
         sql = (
             "SELECT signal_id, symbol, direction, entry_price, stop_loss, take_profit, "
             "risk_reward, total_score, triggered_level, poi_type, "
