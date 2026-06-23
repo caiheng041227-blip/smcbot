@@ -106,17 +106,13 @@ async def replay_recent_state(
 
     suppressed = 0
     alive_by_step: dict = {}
-    persisted = 0
     for sid, s in list(ict_engine.active_signals.items()):
         if s.step == SignalStep.SCORED:
-            # 落盘(在抑制 notification 之前):/signals 命令能查到回放期 SCORED 信号
-            if db is not None:
-                try:
-                    await db.upsert_signal_scored(s)
-                    s.scored_persisted = True
-                    persisted += 1
-                except Exception as e:  # noqa: BLE001
-                    logger.warning(f"replay 落盘 SCORED 信号失败 {sid[:8]}: {e}")
+            # 抑制:标 NOTIFIED 防止 live notify_loop 把回放期信号推送出去。
+            # 2026-06-23:**不再落盘**。replay 引擎是冷启动(_emitted_origins 为空、
+            # 窗口预热不同),会重新推导出 live 当时去重掉/未产的"幽灵"信号;落盘它们
+            # 会在 signals 表留下无 tracker、outcome 永空的孤儿(/signals 误显示"进行中")。
+            # 真实信号在 live 评分时已由 notify_loop 落盘 + 建 tracker,replay 落盘纯属冗余。
             s.notification_sent = True
             s.step = SignalStep.NOTIFIED
             suppressed += 1
@@ -125,7 +121,7 @@ async def replay_recent_state(
 
     logger.info(
         f"replay 完成: 处理 {replayed} close 事件 (cutoff={hours}h), "
-        f"抑制 {suppressed} 条过期 SCORED(落盘 {persisted}), 保留 in-flight: {alive_by_step}"
+        f"抑制 {suppressed} 条回放期 SCORED(不落盘,防幽灵), 保留 in-flight: {alive_by_step}"
     )
 
 
