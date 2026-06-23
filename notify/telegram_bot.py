@@ -36,8 +36,9 @@ except ImportError:  # 允许在无依赖环境下 import 模块
 
 
 # 按钮文字 → 对应命令映射(点击时 bot 收到的是文本)
-# 2026-05-07:删 _BTN_6H,改用 _BTN_HEARTBEAT(SMC bot 心跳)
+# 2026-05-07:删 _BTN_6H,改用 _BTN_HEARTBEAT(ICT bot 心跳)
 _BTN_HEARTBEAT = "🫀 心跳"
+_BTN_SNAPSHOT = "📈 盘面"
 _BTN_24H = "📊 近 24h"
 _BTN_3D = "📊 近 3 天"
 _BTN_ACTIVE = "⏳ in-flight"
@@ -51,8 +52,9 @@ def _build_reply_keyboard() -> Any:
         return None
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton(_BTN_HEARTBEAT), KeyboardButton(_BTN_24H), KeyboardButton(_BTN_3D)],
-            [KeyboardButton(_BTN_ACTIVE), KeyboardButton(_BTN_STATUS), KeyboardButton(_BTN_HELP)],
+            [KeyboardButton(_BTN_HEARTBEAT), KeyboardButton(_BTN_SNAPSHOT), KeyboardButton(_BTN_STATUS)],
+            [KeyboardButton(_BTN_24H), KeyboardButton(_BTN_3D), KeyboardButton(_BTN_ACTIVE)],
+            [KeyboardButton(_BTN_HELP)],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -112,6 +114,7 @@ class TelegramNotifier:
             self._app.add_handler(CommandHandler("signals", self._cmd_signals))
             self._app.add_handler(CommandHandler("active", self._cmd_active))
             self._app.add_handler(CommandHandler("status", self._cmd_status))
+            self._app.add_handler(CommandHandler("snapshot", self._cmd_snapshot))
             self._app.add_handler(CommandHandler("close", self._cmd_close))
             self._app.add_handler(CommandHandler("ask", self._cmd_ask))
             self._app.add_handler(CommandHandler("help", self._cmd_help))
@@ -572,6 +575,7 @@ class TelegramNotifier:
             "<code>/signals [小时]</code>  查近 N 小时(默认 6,最多 168)\n"
             "<code>/active</code>          当前 in-flight 信号\n"
             "<code>/status</code>          Bot 状态 + 最近 K 线时间\n"
+            "<code>/snapshot</code>        盘面快照(多级别结构 + bias + 流动性池)\n"
             "<code>/close &lt;sid&gt;</code>   手动关闭一个 tracker(不再监控 TP/SL)\n"
             "<code>/ask &lt;问题&gt;</code>   问 Claude 任何问题(查/改/部署 bot)\n"
             "<code>/help</code>            显示帮助",
@@ -601,6 +605,27 @@ class TelegramNotifier:
             return
         await update.message.reply_text(text, reply_markup=kb)
 
+    async def _cmd_snapshot(self, update: Any, context: Any) -> None:
+        """ICT 盘面快照:多级别结构 + bias + dealing range + 流动性池 + 周月极值。
+        依赖 main.py 注入 self.snapshot_text_builder。"""
+        if not self._is_authorized(update):
+            return
+        builder = getattr(self, "snapshot_text_builder", None)
+        kb = _build_reply_keyboard()
+        if builder is None:
+            await update.message.reply_text(
+                "⚠️ 盘面快照未配置(notifier.snapshot_text_builder 未注入)",
+                reply_markup=kb,
+            )
+            return
+        try:
+            text = await builder()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"_cmd_snapshot 调用 builder 失败: {e}")
+            await update.message.reply_text(f"⚠️ 盘面快照生成失败:{e}", reply_markup=kb)
+            return
+        await update.message.reply_text(text, reply_markup=kb)
+
     async def _on_text(self, update: Any, context: Any) -> None:
         """处理按钮点击(ReplyKeyboard 发来的是纯文本)。"""
         if not self._is_authorized(update):
@@ -609,6 +634,8 @@ class TelegramNotifier:
         # 模拟 context.args 以复用命令 handler
         if _BTN_HEARTBEAT in text:
             await self._cmd_heartbeat(update, context)
+        elif _BTN_SNAPSHOT in text:
+            await self._cmd_snapshot(update, context)
         elif _BTN_24H in text:
             context.args = ["24"]
             await self._cmd_signals(update, context)

@@ -47,6 +47,7 @@ async def replay_recent_state(
     levels: KeyLevels,
     proxy: Optional[str] = None,
     db: Optional[Any] = None,
+    exchange: str = "binance",
 ) -> None:
     """重启后回放近 N 小时历史,重建 ICT engine 的 active_signals + VP/levels。
 
@@ -61,8 +62,8 @@ async def replay_recent_state(
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp() * 1000)
     tfs = [t for t in timeframes if t != "1m"]  # 1m 不驱动 state_machine
     bar_counts = {
-        "1d": 30,
-        "4h": 130,  # ICT _scan_4h 用 window(100) + dealing_range lookback 60,预热给足
+        "1d": 120,  # daily bias 只需 30,但盘面快照的日线 S/R 要更深的 swing 历史
+        "4h": 200,  # ICT _scan_4h 用 window(100) + dealing_range lookback 60 + 快照 4H S/R
         "1h": max(200, hours + 100),
         "15m": max(300, hours * 4 + 200),
     }
@@ -70,7 +71,7 @@ async def replay_recent_state(
     klines_by_tf: dict = {}
     for tf in tfs:
         try:
-            rows = await fetch_klines(symbol, tf, limit=bar_counts.get(tf, 200), proxy=proxy)
+            rows = await fetch_klines(symbol, tf, limit=bar_counts.get(tf, 200), proxy=proxy, exchange=exchange)
             klines_by_tf[tf] = rows
             logger.info(f"replay 预取 {symbol} {tf}: {len(rows)} 根")
         except Exception as e:  # noqa: BLE001
@@ -161,6 +162,8 @@ async def main_async() -> None:
     timeframes = cfg["timeframes"]
     tz_name = cfg["timezone"]
     reset_hour = int(cfg["daily_reset_hour"])
+    # REST 回填/replay 预取必须与 live WS 同交易所(否则日线对齐错配,见 fetch_klines)
+    exchange = (cfg.get("exchange") or "binance").lower()
 
     vp_session = VolumeProfileSession(
         timezone=tz_name,
@@ -262,11 +265,12 @@ async def main_async() -> None:
                 levels=levels,
                 proxy=bf_proxy,
                 db=db,
+                exchange=exchange,
             )
         else:
             # 回放关闭时退回原纯回填行为
-            backfill_counts = {"1d": 30, "4h": 130, "1h": 200, "15m": 200}
-            await backfill_to_manager(candles, symbol, kline_tfs, backfill_counts, proxy=bf_proxy)
+            backfill_counts = {"1d": 120, "4h": 200, "1h": 200, "15m": 200}
+            await backfill_to_manager(candles, symbol, kline_tfs, backfill_counts, proxy=bf_proxy, exchange=exchange)
     except Exception as e:  # noqa: BLE001
         logger.error(f"REST 回填/状态回放失败(继续用 WS 冷启动): {e}")
 
@@ -324,6 +328,80 @@ async def main_async() -> None:
         bias_note = {"bullish": "只放行 long", "bearish": "只放行 short",
                      "neutral": "两向均可", "?": "数据不足"}.get(daily_bias, "")
         lines.extend(["", f"🧭 ICT daily bias: {emoji_map.get(daily_bias, '❓')} {daily_bias}({bias_note})"])
+        return "\n".join(lines)
+
+    def _cluster_levels(prices: list, tol: float, maxwidth: float) -> list:
+        """把临近的 swing 价位聚成区间。返回 [(lo, hi), ...] 按价升序。
+        tol:相邻两点合并的最大间距;maxwidth:单个区间封顶宽度(防一串 swing 链成大坨)。"""
+        if not prices:
+            return []
+        ps = sorted(prices)
+        clusters = [[ps[0], ps[0]]]
+        for p in ps[1:]:
+            lo, hi = clusters[-1]
+            if p - hi <= tol and p - lo <= maxwidth:
+                clusters[-1][1] = p
+            else:
+                clusters.append([p, p])
+        return [(lo, hi) for lo, hi in clusters]
+
+    def _fmt_level(lo: float, hi: float) -> str:
+        """单点显示一个数,成区间显示 lo-hi。"""
+        if hi - lo < max(lo * 0.0015, 1e-9):
+            return f"{lo:.0f}"
+        return f"{lo:.0f}-{hi:.0f}"
+
+    async def build_snapshot_text() -> str:
+        """像博主那样列各级别支撑/阻力位 —— 用结构性 swing 高低点(客观 S/R),
+        临近的自动聚成区间。不预测走势。"""
+        from engine.market_structure import find_swing_points_atr
+
+        emoji_map = {"bullish": "🟢 偏多", "bearish": "🔴 偏空", "neutral": "⚪ 震荡", "?": "❓"}
+
+        last_1h = candles.last(symbol, "1h", closed_only=True)
+        px = last_1h.close if last_1h else None
+        if px is None:
+            return "📊 盘面快照:数据预热中,稍后再试"
+
+        lines = [
+            f"📊 {symbol} 支撑/阻力 "
+            f"[{datetime.now(timezone.utc).astimezone(_hb_ny).strftime('%m-%d %H:%M ET')}]",
+            f"💲 现价 {px:.2f}",
+            "━━━━━━━━━━━━━━━",
+        ]
+
+        # 各级别:swing 高低点 → 现价上方=阻力 / 下方=支撑,聚区间,各取最近 3 档
+        TF_PLAN = [("1d", "日线", 120), ("4h", "4H", 200), ("1h", "1H", 150)]
+        for tf, label, win_n in TF_PLAN:
+            win = candles.window(symbol, tf, win_n)
+            if len(win) < 13:
+                continue
+            atr_v = ict_engine._atr(symbol, tf)
+            if atr_v <= 0:
+                continue
+            highs, lows = find_swing_points_atr(list(win), atr_v, 1.0)
+            trend = classify_structure_atr(list(win), atr_v, 1.0)
+            pivots = [float(h["price"]) for h in highs] + [float(l["price"]) for l in lows]
+            tol = max(px * 0.003, atr_v * 0.3)   # 相邻合并间距:0.3% 或 0.3×ATR 取大
+            mw = px * 0.012                      # 单区间封顶宽度 ≈1.2%,防 swing 链成大坨
+            res = _cluster_levels([p for p in pivots if p > px], tol, mw)[:3]          # 阻力:近→远
+            sup = list(reversed(_cluster_levels([p for p in pivots if p < px], tol, mw)))[:3]  # 支撑:近→远
+            if not res and not sup:
+                continue
+            lines.append(f"【{label}级别】 {emoji_map.get(trend, '❓')}")
+            lines.append("  🔴 阻力: " + ("  ".join(_fmt_level(lo, hi) for lo, hi in res) or "—(上方无结构)"))
+            lines.append("  🟢 支撑: " + ("  ".join(_fmt_level(lo, hi) for lo, hi in sup) or "—(下方无结构)"))
+            lines.append("")
+
+        # ICT bias(决定 bot 当前只发哪个方向的信号)
+        try:
+            bias = ict_engine._check_daily_bias(symbol) or "neutral"
+        except Exception:  # noqa: BLE001
+            bias = "?"
+        bias_note = {"bullish": "bot 当前只发 long", "bearish": "bot 当前只发 short",
+                     "neutral": "bot 两向均可", "?": "数据不足"}.get(bias, "")
+        lines.append(f"🧭 ICT bias: {emoji_map.get(bias, '❓')} — {bias_note}")
+        lines += ["", "⚠️ 客观 swing 高低点,非预测;价格接近时才是真支撑/阻力"]
         return "\n".join(lines)
 
     async def heartbeat_loop():
@@ -468,9 +546,10 @@ async def main_async() -> None:
             pass  # Windows 兼容，本项目 macOS 不触发
 
     logger.info(f"启动数据采集: {symbol}  tf={timeframes}  tz={tz_name}")
-    # 把心跳文本组装函数注入 notifier,让 TG 按钮能手动触发
+    # 把心跳 / 盘面快照文本组装函数注入 notifier,让 TG 按钮能手动触发
     if notifier is not None:
         notifier.heartbeat_text_builder = build_heartbeat_text  # type: ignore[attr-defined]
+        notifier.snapshot_text_builder = build_snapshot_text  # type: ignore[attr-defined]
 
     tasks = [
         asyncio.create_task(ws.run()),

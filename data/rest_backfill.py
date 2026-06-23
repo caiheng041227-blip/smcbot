@@ -147,8 +147,17 @@ async def fetch_klines(
     limit: int = 200,
     proxy: Optional[str] = None,
     timeout_s: float = 15.0,
+    exchange: str = "binance",
 ) -> List[dict]:
-    """返回 Binance kline 数组,每条为 WS 'k' 同构字典(t/T/o/h/l/c/v/x)。"""
+    """返回 kline 数组,每条为 WS 'k' 同构字典(t/T/o/h/l/c/v/x)。
+
+    exchange='okx' 时直接走 OKX —— 必须与 live WS 的交易所一致,否则日线对齐错配:
+    Binance 日线 00:00 UTC 对齐,OKX 日线 16:00 UTC(港时)对齐,混用会让 daily bias
+    用错一套日线收盘价(2026-06-23 实锤:Lightsail 上 Binance 通,预取 00:00 对齐日线,
+    与 OKX WS 16:00 对齐冲突,bias 被带成 bullish)。
+    """
+    if (exchange or "").lower() == "okx":
+        return await _fetch_klines_okx(symbol, timeframe, limit, proxy, timeout_s)
     url = f"{_REST_BASE}/fapi/v1/klines"
     params = {"symbol": symbol.upper(), "interval": timeframe, "limit": int(limit)}
     timeout = aiohttp.ClientTimeout(total=timeout_s)
@@ -201,15 +210,17 @@ async def backfill_to_manager(
     timeframes: List[str],
     counts: dict,
     proxy: Optional[str] = None,
+    exchange: str = "binance",
 ) -> None:
     """并发拉取多个 TF 的历史 K 线,灌入 candle_manager。
 
     counts: {tf: desired_count}。不在 counts 里的 tf 用默认 200。
+    exchange:必须与 live WS 一致(见 fetch_klines 注释)。
     """
     async def one(tf: str) -> None:
         limit = int(counts.get(tf, 200))
         try:
-            rows = await fetch_klines(symbol, tf, limit=limit, proxy=proxy)
+            rows = await fetch_klines(symbol, tf, limit=limit, proxy=proxy, exchange=exchange)
         except Exception as e:  # noqa: BLE001
             logger.error(f"REST 回填 {symbol} {tf} 失败: {e}")
             return
