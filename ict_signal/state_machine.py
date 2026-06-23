@@ -216,17 +216,11 @@ class ICTSignalEngine:
         atr_1d = self._atr(symbol, "1d", closed_only=True)
         if atr_1d <= 0:
             return None
-        bias = detect_daily_bias(
+        return detect_daily_bias(
             d1, atr_1d,
             lookback=self.daily_bias_lookback,
             min_move_mult=self.daily_bias_min_move,
         )
-        # 临时诊断(确认修复后删):dump bias 计算输入
-        logger.info(
-            f"[BIAS-DEBUG] n={len(d1)} last3={[(int(c.open_time), round(c.close, 1)) for c in d1[-3:]]} "
-            f"atr1d={atr_1d:.2f} bias={bias}"
-        )
-        return bias
 
     def _check_h4_bias(self, symbol: str) -> Optional[str]:
         """4h ATR pivot 结构判定(daily MSS 滞后时的早期预警)。
