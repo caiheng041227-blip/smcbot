@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import os
+import pickle
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -30,6 +32,157 @@ from data.candle_manager import CandleManager
 from data.rest_backfill import fetch_klines
 from ict_signal import ICTSignalEngine, SignalStep
 from utils.logger import logger, setup_logger
+
+_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "bt_cache"
+
+
+async def load_klines(
+    symbol: str,
+    days: int,
+    cfg: dict,
+    use_cache: bool = True,
+    refresh: bool = False,
+) -> Dict[str, List[dict]]:
+    """拉取(或从本地缓存读取)回测所需的 1d/4h/1h/15m K 线。
+
+    缓存:`data/bt_cache/{symbol}_{days}d.pkl`。一次拉取多次复用 —— 让参数扫描 / regime
+    诊断 / TP A/B 等迭代变成秒级离线操作(也让 workflow 多 agent 并行回测可行)。
+    `refresh=True` 强制重新联网拉取并覆盖缓存。研究期固定快照 = 可复现。
+    """
+    cache_path = _CACHE_DIR / f"{symbol}_{days}d.pkl"
+    if use_cache and not refresh and cache_path.exists():
+        with open(cache_path, "rb") as f:
+            klines = pickle.load(f)
+        n = {tf: len(v) for tf, v in klines.items()}
+        logger.info(f"[CACHE] 命中 {cache_path.name}: {n}")
+        return klines
+
+    proxy = cfg.get("binance", {}).get("proxy") or os.getenv("HTTP_PROXY") or None
+    from data.rest_backfill import _fetch_klines_okx
+
+    async def _fetch(sym, tf, lim):
+        if lim > 1500:
+            return await _fetch_klines_okx(sym, tf, lim, proxy, timeout_s=30)
+        return await fetch_klines(sym, tf, limit=lim, proxy=proxy)
+
+    # 15m 不参与 ICT 信号生成(engine 只在 4h/1h 上动作,daily bias 读 1d),且前瞻模拟用 1h。
+    # 不再拉 15m(原占 fetch 量 ~80%),回测提速数倍。
+    needs = {
+        "1d": days + 30,
+        "4h": days * 6 + 60,
+        "1h": days * 24 + 200,
+    }
+    klines: Dict[str, List[dict]] = {}
+    for tf, limit in needs.items():
+        klines[tf] = await _fetch(symbol, tf, limit)
+        logger.info(f"  拉取 {symbol} {tf}: {len(klines[tf])} 根")
+
+    if use_cache:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "wb") as f:
+            pickle.dump(klines, f)
+        logger.info(f"[CACHE] 已写入 {cache_path}")
+    return klines
+
+
+# --- 绩效度量(#4:回测度量加强)----------------------------------------------
+
+def compute_metrics(closed: List[dict], pnl_key: str = "pnl_r") -> Dict[str, float]:
+    """从已闭合交易序列(按时间升序)算一组绩效度量。
+
+    - max_drawdown_r:R 累计曲线的最大回撤(峰值到谷值,单位 R)
+    - profit_factor:毛盈 / 毛亏
+    - expectancy:每单期望 R
+    - avg_win / avg_loss / payoff:平均盈亏 R 与盈亏比
+    - max_consec_loss:最长连亏
+    - win_rate / total_r / n
+    """
+    rs = [float(r.get(pnl_key) or 0.0) for r in closed]
+    n = len(rs)
+    if n == 0:
+        return {"n": 0, "total_r": 0.0, "win_rate": 0.0, "expectancy": 0.0,
+                "profit_factor": 0.0, "max_drawdown_r": 0.0, "avg_win": 0.0,
+                "avg_loss": 0.0, "payoff": 0.0, "max_consec_loss": 0}
+    wins = [x for x in rs if x > 0]
+    losses = [x for x in rs if x < 0]
+    gross_win = sum(wins)
+    gross_loss = abs(sum(losses))
+    # 最大回撤(R 曲线)
+    cum = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for x in rs:
+        cum += x
+        peak = max(peak, cum)
+        max_dd = max(max_dd, peak - cum)
+    # 最长连亏
+    consec = 0
+    max_consec = 0
+    for x in rs:
+        if x < 0:
+            consec += 1
+            max_consec = max(max_consec, consec)
+        else:
+            consec = 0
+    avg_win = gross_win / len(wins) if wins else 0.0
+    avg_loss = gross_loss / len(losses) if losses else 0.0
+    return {
+        "n": n,
+        "total_r": sum(rs),
+        "win_rate": len(wins) / n,
+        "expectancy": sum(rs) / n,
+        "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else float("inf"),
+        "max_drawdown_r": max_dd,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "payoff": (avg_win / avg_loss) if avg_loss > 0 else float("inf"),
+        "max_consec_loss": max_consec,
+    }
+
+
+def single_position_r(closed: List[dict], ny, bar_ms: int = 3_600_000):
+    """单仓口径 ΣR:同一时间只允许 1 个持仓,在仓时新信号被跳过(贪心,按入场时间)。
+
+    匹配"实盘同一时间只能开一单":自动剔除所有重叠 / 近似重复单。
+    入场时间 = 信号时间 + fill_bars 根(limit 等回踩);出场 = 入场 + bars 根。
+    返回 (ΣR, 取用笔数, {year: ΣR})。
+    """
+    trades = []
+    for r in closed:
+        fb = r.get("fill_bars", 0) or 0
+        nb = r.get("bars", 1) or 1
+        entry_ms = int(r["time"]) + fb * bar_ms
+        exit_ms = entry_ms + max(1, nb) * bar_ms
+        trades.append((entry_ms, exit_ms, float(r.get("pnl_r") or 0.0)))
+    trades.sort(key=lambda x: x[0])
+    busy_until = 0
+    total = 0.0
+    taken = 0
+    per_year: Dict[int, float] = defaultdict(float)
+    for entry_ms, exit_ms, pnl in trades:
+        if entry_ms < busy_until:
+            continue  # 仍在仓 → 跳过这条信号
+        total += pnl
+        taken += 1
+        yr = datetime.fromtimestamp(entry_ms / 1000.0, tz=timezone.utc).astimezone(ny).year
+        per_year[yr] += pnl
+        busy_until = exit_ms
+    return total, taken, dict(per_year)
+
+
+def _fmt_metrics(m: Dict[str, float]) -> str:
+    if m["n"] == 0:
+        return "  (无闭合交易)"
+    pf = m["profit_factor"]
+    pf_s = "∞" if pf == float("inf") else f"{pf:.2f}"
+    po = m["payoff"]
+    po_s = "∞" if po == float("inf") else f"{po:.2f}"
+    return (
+        f"  闭合 {m['n']}  胜率 {m['win_rate']:.1%}  ΣR {m['total_r']:+.2f}  "
+        f"期望 {m['expectancy']:+.3f}R/单\n"
+        f"  盈亏比 {po_s}(均盈 {m['avg_win']:+.2f} / 均亏 {m['avg_loss']:-.2f})  "
+        f"盈利因子 {pf_s}  最大回撤 {m['max_drawdown_r']:.2f}R  最长连亏 {m['max_consec_loss']}"
+    )
 
 
 # --- 前瞻 TP/SL 模拟 -------------------------------------------------------
@@ -239,30 +392,12 @@ def simulate_outcome_hybrid(
 
 # --- 主回测流程 ------------------------------------------------------------
 
-async def run_backtest(symbol: str, days: int, cfg: dict, csv_path: Optional[str] = None, trail_atr_mult: float = 0.0, tp1_portion: float = 0.5) -> None:
+async def run_backtest(symbol: str, days: int, cfg: dict, csv_path: Optional[str] = None, trail_atr_mult: float = 0.0, tp1_portion: float = 0.5, use_cache: bool = True, refresh_cache: bool = False) -> None:
     setup_logger("INFO")
-    import os
-    proxy = cfg.get("binance", {}).get("proxy") or os.getenv("HTTP_PROXY") or None
-    logger.info(f"回测:{symbol} days={days}  proxy={proxy or '无'}")
+    logger.info(f"回测:{symbol} days={days}")
 
-    # 拉历史 K 线(1d/4h/1h/15m)。Binance limit 上限 1500,>1500 走 OKX 两段拉取
-    # (`/market/candles` + `/market/history-candles`,可拉到 ~1 年前)。
-    from data.rest_backfill import _fetch_klines_okx
-    async def _fetch(sym, tf, lim):
-        if lim > 1500:
-            return await _fetch_klines_okx(sym, tf, lim, proxy, timeout_s=30)
-        return await fetch_klines(sym, tf, limit=lim, proxy=proxy)
-
-    needs = {
-        "1d": days + 30,
-        "4h": days * 6 + 60,
-        "1h": days * 24 + 200,
-        "15m": days * 96 + 300,
-    }
-    klines: Dict[str, List[dict]] = {}
-    for tf, limit in needs.items():
-        klines[tf] = await _fetch(symbol, tf, limit)
-        logger.info(f"  拉取 {symbol} {tf}: {len(klines[tf])} 根")
+    # 拉历史 K 线(1d/4h/1h/15m),命中本地缓存则秒级返回(见 load_klines)
+    klines = await load_klines(symbol, days, cfg, use_cache=use_cache, refresh=refresh_cache)
 
     # 构造 ICT engine(项目唯一信号 pipeline;SMC 管线 2026-06-10 删除)
     candles = CandleManager(maxlen=3000)
@@ -394,11 +529,48 @@ async def run_backtest(symbol: str, days: int, cfg: dict, csv_path: Optional[str
 
     # 汇总
     closed = [r for r in results if r["outcome"] in ("tp", "sl")]
+    closed.sort(key=lambda r: r["time"])  # 时间序:让回撤 / 连亏度量有意义
     wins = [r for r in closed if r["outcome"] == "tp"]
     total_r = sum(r["pnl_r"] for r in closed)
     print("-" * 100)
     print(f"信号: {len(results)}  已闭合: {len(closed)}  胜: {len(wins)}  "
           f"胜率: {(len(wins)/max(1,len(closed))):.1%}  累计 R: {total_r:+.2f}")
+
+    # ---- 绩效度量(#4)----
+    print("-" * 100)
+    print("[绩效度量]")
+    print(_fmt_metrics(compute_metrics(closed)))
+    # 未成交占比(limit 单的执行风险)
+    n_unfilled = sum(1 for r in results if r["outcome"] == "expired_unfilled")
+    n_pending = sum(1 for r in results if r["outcome"] == "pending")
+    print(f"  未成交(expired_unfilled): {n_unfilled}  到期未平(pending): {n_pending}  "
+          f"/ 总信号 {len(results)}")
+
+    # ---- 单仓口径(#4):同一时间只持 1 仓,在仓则跳过新信号 ----
+    # 这是匹配"实盘只能开一单"的真实账目 —— 自动剔除所有重叠/近似重复单,
+    # 比按价格判重更彻底。无限叠仓的 ΣR 对单仓交易者是虚高。
+    sp_total, sp_taken, sp_year = single_position_r(closed, ny)
+    print("-" * 100)
+    print(f"[单仓口径(同一时间最多 1 仓)]  取用 {sp_taken}/{len(closed)} 笔  ΣR {sp_total:+.2f}"
+          f"  (无限叠仓口径 {total_r:+.2f})")
+    if sp_year:
+        print("  各年: " + "  ".join(f"{y}:{sp_year[y]:+.1f}" for y in sorted(sp_year)))
+
+    # ---- 按年份切分(#4 / #1:regime 依赖体检,样本外铁律)----
+    by_year = defaultdict(list)
+    for r in closed:
+        yr = datetime.fromtimestamp(r["time"] / 1000.0, tz=timezone.utc).astimezone(ny).year
+        by_year[yr].append(r)
+    if len(by_year) > 1:
+        print("-" * 100)
+        print("[按年份切分(ET),无限叠仓口径]")
+        for yr in sorted(by_year.keys()):
+            m = compute_metrics(sorted(by_year[yr], key=lambda r: r["time"]))
+            pf = m["profit_factor"]
+            pf_s = "∞" if pf == float("inf") else f"{pf:.2f}"
+            print(f"  {yr}:  闭合 {m['n']:3d}  胜率 {m['win_rate']:>5.1%}  "
+                  f"ΣR {m['total_r']:+7.2f}  期望 {m['expectancy']:+.3f}  "
+                  f"PF {pf_s}  最大回撤 {m['max_drawdown_r']:.1f}R")
 
     # 按 source_engine 分组
     by_engine = defaultdict(list)
@@ -534,6 +706,8 @@ def main() -> None:
     ap.add_argument("--trail-atr", type=float, default=0.0,
                     help="启用 hybrid trail:设成 >0(如 1.5),TP1 平仓后剩余按 peak − N×ATR_4h 追踪。0=仅跑 baseline")
     ap.add_argument("--tp1-portion", type=float, default=0.5, help="hybrid 模式 TP1 平仓比例(0-1)")
+    ap.add_argument("--no-cache", action="store_true", help="禁用 K 线缓存,强制每次联网拉取")
+    ap.add_argument("--refresh-cache", action="store_true", help="刷新缓存(联网重拉并覆盖本地快照)")
     args = ap.parse_args()
 
     with open(ROOT / "config.yaml", "r", encoding="utf-8") as f:
@@ -542,7 +716,8 @@ def main() -> None:
     symbol = args.symbol or cfg["symbol"]
 
     asyncio.run(run_backtest(symbol, args.days, cfg, csv_path=args.csv,
-                             trail_atr_mult=args.trail_atr, tp1_portion=args.tp1_portion))
+                             trail_atr_mult=args.trail_atr, tp1_portion=args.tp1_portion,
+                             use_cache=not args.no_cache, refresh_cache=args.refresh_cache))
 
 
 if __name__ == "__main__":

@@ -233,6 +233,7 @@ def find_ict_ote_setups(
     min_rr: float = 1.0,
     require_displacement: bool = True,
     displacement_min_height_atr: float = 0.25,
+    tp_fixed_rr: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """OTE 检测:最近 4h 显著 leg 的 62-79% 回撤区间 + HTF aligned。
 
@@ -287,22 +288,22 @@ def find_ict_ote_setups(
             return []
 
     entry = current_price
-    if leg_dir == "long":
-        sl = leg_start - sl_atr_mult * atr_4h
-        tp = _calc_tp_from_dealing_range(leg_dir, entry, sl, dealing_range)
-        # 若 dealing_range 不提供,默认 TP = leg_end + 30% leg(extension)
-        if dealing_range is None:
-            tp = leg_end + 0.3 * rng
-    else:
-        sl = leg_start + sl_atr_mult * atr_4h
-        tp = _calc_tp_from_dealing_range(leg_dir, entry, sl, dealing_range)
-        if dealing_range is None:
-            tp = leg_end - 0.3 * rng
-
+    sl = leg_start - sl_atr_mult * atr_4h if leg_dir == "long" else leg_start + sl_atr_mult * atr_4h
     risk = abs(entry - sl)
-    reward = abs(entry - tp)
     if risk <= 0:
         return []
+    # TP:#2(2026-06-23)tp_fixed_rr>0 时用定倍 R(OTE 实测 +1.1→+20.5R);
+    # 否则回退原逻辑(dealing range 对侧 / 无 DR 则 leg 30% extension)。
+    if tp_fixed_rr > 0:
+        tp = entry + tp_fixed_rr * risk if leg_dir == "long" else entry - tp_fixed_rr * risk
+        tp_basis = f"fixed_{tp_fixed_rr:g}R"
+    else:
+        tp = _calc_tp_from_dealing_range(leg_dir, entry, sl, dealing_range)
+        if dealing_range is None:
+            tp = leg_end + 0.3 * rng if leg_dir == "long" else leg_end - 0.3 * rng
+        tp_basis = "dealing_range"
+
+    reward = abs(entry - tp)
     rr = reward / risk
     if rr < min_rr:
         return []
@@ -327,6 +328,7 @@ def find_ict_ote_setups(
             "leg_start": leg_start,
             "leg_end": leg_end,
             "leg_end_time": leg_end_time,
+            "tp_basis": tp_basis,
             "retracement_pct": ((leg_end - current_price) / rng) if leg_dir == "long"
                               else ((current_price - leg_end) / rng),
         },

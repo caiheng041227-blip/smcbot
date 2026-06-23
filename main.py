@@ -61,10 +61,14 @@ async def replay_recent_state(
     """
     cutoff_ms = int((datetime.now(timezone.utc) - timedelta(hours=hours)).timestamp() * 1000)
     tfs = [t for t in timeframes if t != "1m"]  # 1m 不驱动 state_machine
+    # OTE 趋势门(#1)需 ~720(MA)+168(斜率) 根 1h 才能激活;否则 fail-open 永不生效。
+    # 从 engine 读门配置,自动同步 ote_trend_ma_bars(不开门时为 0,退回原 200)。
+    ote_need = (getattr(ict_engine, "ote_trend_ma_bars", 720) + 180) \
+        if getattr(ict_engine, "ote_trend_gate_enabled", False) else 0
     bar_counts = {
         "1d": 120,  # daily bias 只需 30,但盘面快照的日线 S/R 要更深的 swing 历史
         "4h": 200,  # ICT _scan_4h 用 window(100) + dealing_range lookback 60 + 快照 4H S/R
-        "1h": max(200, hours + 100),
+        "1h": max(200, hours + 100, ote_need),
         "15m": max(300, hours * 4 + 200),
     }
 
@@ -268,8 +272,10 @@ async def main_async() -> None:
                 exchange=exchange,
             )
         else:
-            # 回放关闭时退回原纯回填行为
-            backfill_counts = {"1d": 120, "4h": 200, "1h": 200, "15m": 200}
+            # 回放关闭时退回原纯回填行为(1h 同样要够 OTE 趋势门激活)
+            ote_need = (getattr(ict_engine, "ote_trend_ma_bars", 720) + 180) \
+                if getattr(ict_engine, "ote_trend_gate_enabled", False) else 200
+            backfill_counts = {"1d": 120, "4h": 200, "1h": max(200, ote_need), "15m": 200}
             await backfill_to_manager(candles, symbol, kline_tfs, backfill_counts, proxy=bf_proxy, exchange=exchange)
     except Exception as e:  # noqa: BLE001
         logger.error(f"REST 回填/状态回放失败(继续用 WS 冷启动): {e}")

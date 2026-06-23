@@ -89,6 +89,10 @@ class ICTSignalEngine:
         self.ote_require_displacement = bool(ict_cfg.get("ote_require_displacement", False))
         self.displacement_min_height_atr = float(ict_cfg.get("displacement_min_height_atr", 0.25))
         self.raid_confirm_within_bars = int(ict_cfg.get("raid_confirm_within_bars", 5))
+        # OTE 专项(2026-06-23,1095d OOS):#1 趋势门 + #2 定倍 TP
+        self.ote_trend_gate_enabled = bool(ict_cfg.get("ote_trend_gate_enabled", True))
+        self.ote_trend_ma_bars = int(ict_cfg.get("ote_trend_ma_bars", 720))
+        self.ote_tp_fixed_rr = float(ict_cfg.get("ote_tp_fixed_rr", 0.0))
         # 4 个 POI 类型独立开关(Phase A 默认: OB+OTE+raid 开,mss_retest 关 — 后者需 2 步状态机)
         self.pois_enabled = ict_cfg.get("pois") or {}
         self.poi_ob_enabled = bool(self.pois_enabled.get("ob", True))
@@ -236,6 +240,30 @@ class ICTSignalEngine:
         if atr_4h <= 0:
             return None
         return classify_structure_atr(h4, atr_4h, min_move_mult=self.h4_bias_min_move)
+
+    def _ote_trend(self, symbol: str) -> Optional[str]:
+        """30d 动量趋势(1h MA + 7d 斜率),正交于结构 bias(daily/4h MSS)。
+
+        返回 'up' / 'down' / 'range' / None。OTE 趋势门(#1)用:逆此趋势的 OTE 否决。
+        数据不足 → None = 放行(fail-open;与回测早期窗口一致)。
+        """
+        if not self.ote_trend_gate_enabled:
+            return None
+        bars = self.ote_trend_ma_bars
+        slope_bars = 168  # 7d 斜率窗口(诊断验证用值,固定)
+        h1 = self.candles.window(symbol, "1h", bars + slope_bars + 10)
+        if len(h1) < bars + slope_bars:
+            return None
+        closes = [float(c["close"]) if isinstance(c, dict) else float(c.close) for c in h1]
+        c = closes[-1]
+        ma_now = sum(closes[-bars:]) / bars
+        ma_prev = sum(closes[-bars - slope_bars:-slope_bars]) / bars
+        slope_up = ma_now > ma_prev
+        if c > ma_now and slope_up:
+            return "up"
+        if c < ma_now and not slope_up:
+            return "down"
+        return "range"
 
     def _check_zone(self, symbol: str, price: float) -> Optional[str]:
         """返回 'premium' / 'discount' / 'equilibrium' / None。"""
@@ -448,8 +476,17 @@ class ICTSignalEngine:
                 daily_bias=daily_bias, dealing_range=dr,
                 require_displacement=self.ote_require_displacement,
                 displacement_min_height_atr=self.displacement_min_height_atr,
+                tp_fixed_rr=self.ote_tp_fixed_rr,   # #2 定倍 TP(0=回退 DR/3R)
             )
+            ote_trend = self._ote_trend(symbol)     # #1 30d 动量趋势门
             for setup in ote_setups:
+                if ote_trend in ("up", "down"):
+                    d = setup["direction"]
+                    if (d == "long" and ote_trend == "down") or (d == "short" and ote_trend == "up"):
+                        self._diag["ote_trend_gate_veto"] += 1
+                        logger.info(f"[ICT-ict_ote] {d} 被 OTE 趋势门否决"
+                                    f"(30d trend={ote_trend}, entry={setup['entry']:.2f})")
+                        continue
                 sid = self._emit_setup(symbol, setup)
                 if sid:
                     new_sids.append(sid)

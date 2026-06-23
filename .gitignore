@@ -21,6 +21,7 @@ data/market.db-*
 
 # 回测产物 / 分析数据(大文件)
 data/analysis/*.csv
+data/bt_cache/
 
 # GBrain 派生物
 gbrain_integration/jsonl/
