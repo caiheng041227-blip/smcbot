@@ -1,5 +1,7 @@
 # smcbot — an ICT signal bot for ETH perps, built to *not* fool itself
 
+**English** · [中文](README.zh-CN.md)
+
 A single-symbol (ETHUSDT perp) trading **signal** bot implementing a small set of
 ICT / Smart-Money-Concepts setups. It watches the market, and when a setup triggers
 it pushes a signal to Telegram — **you** place the trade manually (advisory, never auto-executes).
