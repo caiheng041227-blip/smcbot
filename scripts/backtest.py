@@ -392,7 +392,7 @@ def simulate_outcome_hybrid(
 
 # --- 主回测流程 ------------------------------------------------------------
 
-async def run_backtest(symbol: str, days: int, cfg: dict, csv_path: Optional[str] = None, trail_atr_mult: float = 0.0, tp1_portion: float = 0.5, use_cache: bool = True, refresh_cache: bool = False) -> None:
+async def run_backtest(symbol: str, days: int, cfg: dict, csv_path: Optional[str] = None, trail_atr_mult: float = 0.0, tp1_portion: float = 0.5, use_cache: bool = True, refresh_cache: bool = False, cost_bp: float = 0.0) -> None:
     setup_logger("INFO")
     logger.info(f"回测:{symbol} days={days}")
 
@@ -556,6 +556,24 @@ async def run_backtest(symbol: str, days: int, cfg: dict, csv_path: Optional[str
     if sp_year:
         print("  各年: " + "  ".join(f"{y}:{sp_year[y]:+.1f}" for y in sorted(sp_year)))
 
+    # ---- 扣真实交易成本(#1:手续费+滑点,往返 cost_bp 个基点)----
+    # 每单成本换算成 R:cost_R = (cost_bp/1e4 × entry) / |entry−sl|。宽 SL 的单成本占 R 更小。
+    if cost_bp and cost_bp > 0:
+        net_closed = []
+        for r in closed:
+            e, sl = r.get("entry"), r.get("sl")
+            cost_r = (cost_bp / 10000.0 * e) / abs(e - sl) if (e and sl and e != sl) else 0.0
+            net_closed.append({**r, "pnl_r": (r["pnl_r"] or 0.0) - cost_r, "_cost_r": cost_r})
+        net_total = sum(x["pnl_r"] for x in net_closed)
+        avg_cost = sum(x["_cost_r"] for x in net_closed) / max(1, len(net_closed))
+        nsp_total, nsp_taken, nsp_year = single_position_r(net_closed, ny)
+        print("-" * 100)
+        print(f"[扣真实成本:往返 {cost_bp:.0f}bp ≈ 每单 −{avg_cost:.3f}R]")
+        print(f"  无限叠仓: 毛 {total_r:+.2f} → 净 {net_total:+.2f}R  (成本 {net_total - total_r:+.2f})")
+        print(f"  单仓口径: 毛 {sp_total:+.2f} → 净 {nsp_total:+.2f}R  (取用 {nsp_taken})")
+        if nsp_year:
+            print("  单仓各年(净): " + "  ".join(f"{y}:{nsp_year[y]:+.1f}" for y in sorted(nsp_year)))
+
     # ---- 按年份切分(#4 / #1:regime 依赖体检,样本外铁律)----
     by_year = defaultdict(list)
     for r in closed:
@@ -708,6 +726,7 @@ def main() -> None:
     ap.add_argument("--tp1-portion", type=float, default=0.5, help="hybrid 模式 TP1 平仓比例(0-1)")
     ap.add_argument("--no-cache", action="store_true", help="禁用 K 线缓存,强制每次联网拉取")
     ap.add_argument("--refresh-cache", action="store_true", help="刷新缓存(联网重拉并覆盖本地快照)")
+    ap.add_argument("--cost-bp", type=float, default=0.0, help="扣真实交易成本:往返基点(如 12 = 手续费+滑点往返 0.12%)")
     args = ap.parse_args()
 
     with open(ROOT / "config.yaml", "r", encoding="utf-8") as f:
@@ -717,7 +736,8 @@ def main() -> None:
 
     asyncio.run(run_backtest(symbol, args.days, cfg, csv_path=args.csv,
                              trail_atr_mult=args.trail_atr, tp1_portion=args.tp1_portion,
-                             use_cache=not args.no_cache, refresh_cache=args.refresh_cache))
+                             use_cache=not args.no_cache, refresh_cache=args.refresh_cache,
+                             cost_bp=args.cost_bp))
 
 
 if __name__ == "__main__":
