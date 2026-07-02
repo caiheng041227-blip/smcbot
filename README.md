@@ -75,7 +75,7 @@ HTF gates: daily MSS bias + premium/discount (dealing range) + a 30-day momentum
 ict_signal/state_machine.py   ICT state machine (4h/1h driven, HTF gates, dedup)
 engine/ict_pois.py            the POI detectors
 engine/ict.py                 HTF-gate primitives (bias / dealing range / zone)
-scripts/backtest.py           backtest harness (costs, single-position, DD/PF, per-year)
+scripts/backtest.py           backtest harness (costs, drawdown, profit factor, per-year OOS)
 scripts/_eval_robustness.py   DSR / PBO / PSR / MinTRL
 notify/telegram_bot.py        Telegram push + commands
 ```
