@@ -1,6 +1,6 @@
 # smcbot — 一个"防止自己骗自己"的 ETH 永续 ICT 信号 bot
 
-[English](README.md) · **中文**
+[![English](https://img.shields.io/badge/README-English-lightgrey?style=flat-square)](README.md) [![中文](https://img.shields.io/badge/README-%E4%B8%AD%E6%96%87-c9302c?style=flat-square)](README.zh-CN.md)
 
 一个单品种(ETHUSDT 永续)的交易**信号** bot,实现了一小组 ICT / Smart-Money-Concepts
 套路。它盯盘,套路触发时把信号推到 Telegram —— **由你手动下单**(纯建议,永不自动执行)。
