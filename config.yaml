@@ -53,7 +53,7 @@ ict:
 
   # 4 种 ICT POI 类型独立开关(每种可单独 toggle):
   pois:
-    ob: true                       # ICT OB at premium/discount(365d:45 信号 / +7.05R)
+    ob: false                      # 2026-07 关闭:净成本期望≤0(1095d 扣12bp转负),毛利全靠单笔+7.94R(去掉即转负),p=0.89 统计死信号,3/4年净负,730d/1095d 双窗一致(scripts/_verify_ob.py)
     ote: true                      # OTE 62-79% retracement(365d:89 信号 / 36% WR / +13.4R)— 主力
     liquidity_raid: true           # 扫荡反转 + 教科书 MSS 确认(365d:34 信号 / 39% WR / +16.4R)
     mss_retest: false              # 4h MSS retest(加教科书 gate 后 365d 16 单打平,不值得开)
