@@ -21,11 +21,11 @@ Backtest over **1095 days (2023 → mid-2026, ~3.5y out-of-sample)**, **net of r
 
 | net @8bp | net @12bp | net @16bp |
 |---:|---:|---:|
-| +38.7R | **+33.1R** | +27.5R |
+| +38.4R | **+33.1R** | +27.9R |
 
-- ~234 trades, ~34% win rate, ~2.3 payoff — the edge is asymmetry, not hit rate. Before costs it's
-  +49.9R; the gap is fees + slippage, priced in via `--cost-bp`.
-- **Per-year:** `2023 +6.8 · 2024 −7.6 · 2025 +4.0 · 2026 +29.8`.
+- ~218 trades, ~34% win rate, ~2.3 payoff — the edge is asymmetry, not hit rate. Before costs it's
+  +48.8R; the gap is fees + slippage, priced in via `--cost-bp`.
+- **Per-year (net @12bp):** `2023 +7.6 · 2024 −6.3 · 2025 +7.4 · 2026 +24.3`.
   **Regime-dependent** — 2024 loses, 2026 carries it. Shown, not hidden.
 - **Per-trade Sharpe ≈ 0.12, p ≈ 0.07** — *borderline*, not confirmed. A small positive edge,
   **not** a money printer.
