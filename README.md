@@ -65,9 +65,19 @@ Ratios*), Kaminski & Lo (*When Do Stop-Loss Rules Stop Losses?*).
 |---|---|---|
 | **liquidity_raid** | sweep of an equal-highs/lows pool + textbook displacement confirmation, then reversal | the real edge (+24R gross) |
 | **OTE** | 62–79% retracement entry, gated to trade *with* the 30-day momentum trend, fixed 2.5R target | main P&L driver |
-| **order_block** | OB at premium/discount | statistically dead, deprecating |
+| **order_block** | OB at premium/discount | removed (statistically dead, p=0.89) |
 
 HTF gates: daily MSS bias + premium/discount (dealing range) + a 30-day momentum trend gate on OTE.
+
+> **What actually held up.** I mechanically backtested many other ICT setups too — naked FVG
+> entries, breaker blocks, rejection blocks, double tops/bottoms, session timing ("silver bullet").
+> Net of costs and out-of-sample, the naked patterns didn't survive (tight stops → costs eat the
+> thin edge). **Every survivor shares one thing: a confirmation step** — a displacement, a trend
+> gate, a reclaim. The pattern alone never paid — which is exactly what ICT itself preaches:
+> confluence, not the pattern.
+>
+> *Caveat:* this is **mechanical** backtesting. ICT is discretionary — a skilled trader reads
+> context this can't encode. It tests "naked patterns as rules," not ICT in a pro's hands.
 
 ## Architecture
 

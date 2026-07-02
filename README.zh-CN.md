@@ -68,6 +68,14 @@ Lo(《Statistics of Sharpe Ratios》)、Kaminski & Lo(《When Do Stop-Loss Rules
 
 HTF 门:日线 MSS bias + premium/discount(dealing range)+ OTE 的 30 天动量趋势门。
 
+> **到底什么扛住了。** 我还机械回测了不少别的 ICT 套路——裸 FVG 入场、breaker block、
+> rejection block、双顶双底、择时("silver bullet")。扣成本 + 样本外之后,**裸模式都没活下来**
+> (止损窄 → 成本吃光薄边)。**活下来的只有一个共同点:一个"确认"步骤**——位移、趋势门、
+> 或 reclaim。裸模式单独从不赚钱——而这恰恰是 ICT 自己强调的:要共振,不是看模式本身。
+>
+> *注:* 这是**机械**回测。ICT 本质是判断型的,高手读盘的那层这里编码不了;测的是"把裸模式
+> 当规则",不是"高手手里的 ICT"。
+
 ## 架构
 
 ```
