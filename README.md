@@ -16,19 +16,19 @@ What makes this repo worth a look isn't the strategy (it's deliberately simple).
 
 ## The honest numbers
 
-Backtest over **1095 days (2023 → mid-2026, ~3.5y out-of-sample)**, reported the way I
-actually trade it — **one position at a time** (no stacking correlated signals to inflate returns):
+Backtest over **1095 days (2023 → mid-2026, ~3.5y out-of-sample)**, **net of real trading costs**
+(round-trip fees + slippage — the thing most retail backtests quietly omit):
 
-| | Gross | Net @8bp | Net @12bp | Net @16bp |
-|---|---:|---:|---:|---:|
-| ΣR (single-position) | +49.9R | +38.7R | **+33.1R** | +27.5R |
+| net @8bp | net @12bp | net @16bp |
+|---:|---:|---:|
+| +38.7R | **+33.1R** | +27.5R |
 
-- **Costs are subtracted.** `--cost-bp` deducts round-trip fees + slippage (8–16bp) per trade.
-  The edge survives, but it's thinner than the gross number — as it should be.
-- **Per-year (net @12bp):** `2023 +6.8 · 2024 −7.6 · 2025 +4.0 · 2026 +29.8`.
-  It is **regime-dependent** — 2024 is negative, 2026 carries it. I don't hide that.
-- **Per-trade Sharpe ≈ 0.12, p ≈ 0.07** — *borderline*, not confirmed. Treat this as a
-  research system with a small positive expectancy, **not** a money printer.
+- ~234 trades, ~34% win rate, ~2.3 payoff — the edge is asymmetry, not hit rate. Before costs it's
+  +49.9R; the gap is fees + slippage, priced in via `--cost-bp`.
+- **Per-year:** `2023 +6.8 · 2024 −7.6 · 2025 +4.0 · 2026 +29.8`.
+  **Regime-dependent** — 2024 loses, 2026 carries it. Shown, not hidden.
+- **Per-trade Sharpe ≈ 0.12, p ≈ 0.07** — *borderline*, not confirmed. A small positive edge,
+  **not** a money printer.
 
 Reproduce it yourself:
 
@@ -43,9 +43,8 @@ python3 scripts/backtest.py --days 1095 --cost-bp 12
 This project's whole history is *"most ideas fail out-of-sample."* The tooling exists to catch
 that **before** deploying, not after a bad year:
 
-- **Single-position accounting** — the headline assumes you hold one trade at a time.
-  Unlimited-stacking sums (+82R here) look great and mislead; single-position (+33R net)
-  is what a one-position trader actually captures. (Sample uniqueness ≈ 1.0 vs 0.79 stacked.)
+- **Costs subtracted by default** — a backtest that ignores fees and slippage is fiction.
+  `--cost-bp` prices in round-trip cost per trade, so the headline is net, not gross.
 - **Per-year OOS as a hard gate** — a change ships only if it doesn't hurt *any* year
   (2023/24/25/26). This single rule has killed most "improvements" I've tried.
 - **Deflated Sharpe (DSR) + Probability of Backtest Overfitting (PBO)** — price in the fact
